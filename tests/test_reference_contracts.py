@@ -96,17 +96,64 @@ class ReferenceContractTest(unittest.TestCase):
             self.assertIn(phrase, compact)
 
     def test_language_and_mathematics_references_have_operational_sections(self):
-        expected_phrases = {
-            "chinese.md": ("文本证据", "作文", "开放题", "迁移验证"),
-            "mathematics.md": ("第一个实质错误", "条件检查", "推导", "变式"),
-            "english.md": ("保留学生原意", "任务完成", "语言准确", "针对性练习"),
+        contracts = {
+            "chinese.md": {
+                "headings": ("诊断", "阅读与材料题", "作文", "练习与状态证据"),
+                "phrases": (
+                    "文本证据",
+                    "作文",
+                    "开放题",
+                    "迁移验证",
+                    "所有模式都不得生成可直接冒充学生作业的整篇替代稿",
+                    "复盘可以提供提纲、局部示范、逐段批注或明确标注的比较学习范文",
+                    "不能替代学生本人修改",
+                    "不得输出与学生水平不匹配的成品",
+                    "涉及精确分数时必须有适用评分标准",
+                    "只有在新文本中复用方法的独立迁移证据，才能提高掌握度",
+                ),
+            },
+            "mathematics.md": {
+                "headings": ("诊断", "讲解与提示", "批改", "练习与状态证据"),
+                "phrases": (
+                    "第一个实质错误",
+                    "条件检查",
+                    "推导",
+                    "变式",
+                    "不得虚构评分点或分数",
+                    "只有独立完成变式并解释方法的迁移证据，才允许提高掌握度",
+                ),
+            },
+            "english.md": {
+                "headings": ("诊断", "阅读与翻译", "写作", "练习与状态证据"),
+                "phrases": (
+                    "保留学生原意",
+                    "任务完成",
+                    "语言准确",
+                    "针对性练习",
+                    "所有模式都不得生成可直接冒充学生作业的整篇替代稿",
+                    "复盘可以提供提纲、局部示范、逐段批注或明确标注的比较学习范文",
+                    "不能替代学生本人修改",
+                    "不得输出与学生水平不匹配的成品",
+                    "没有适用评分标准时，不给精确分数",
+                    "学生必须在新句子、新段落或新文本中独立使用目标能力，才允许提高掌握度",
+                ),
+            },
         }
 
-        for filename, phrases in expected_phrases.items():
+        for filename, contract in contracts.items():
             reference = REFERENCE.parent / filename
             content = reference.read_text(encoding="utf-8")
-            for phrase in phrases:
-                self.assertIn(phrase, content)
+            headings = set(
+                re.findall(r"^##[ \t]+(.+?)[ \t]*$", content, flags=re.MULTILINE)
+            )
+
+            for heading in contract["headings"]:
+                phrase = f"## {heading}"
+                with self.subTest(filename=filename, phrase=phrase):
+                    self.assertIn(heading, headings)
+            for phrase in contract["phrases"]:
+                with self.subTest(filename=filename, phrase=phrase):
+                    self.assertIn(phrase, content)
 
 
 if __name__ == "__main__":

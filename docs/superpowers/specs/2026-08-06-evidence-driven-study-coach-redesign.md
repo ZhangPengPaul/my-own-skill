@@ -264,16 +264,18 @@ student-workspaces/<student-id>/
 |-- profile.md
 |-- state.json
 |-- sessions/
-|   `-- <session-id>.json
+|   `-- <record-id>.json
 |-- plan-items/
-|   `-- <item-id>.json
+|   `-- <record-id>.json
 |-- summaries/
 |   `-- current.md
 `-- materials/
 ```
 
 完整的 `sessions/` 和 `plan-items/` 记录是事实来源；`state.json` 和摘要是派生结果。
-完成的事实记录不可就地修改。需要纠正时新增带有被替代记录 ID 的事实，保留审计链。
+每条事实具有唯一 `record_id`。会话和计划分别另有跨修订稳定的 `session_id` 或
+`item_id`；需要完成、纠正或替代既有记录时，新增包含 `supersedes_record_id` 的事实，
+不就地修改已发布文件。修订链必须无环、无分叉且引用同一稳定 ID，保留完整审计链。
 材料只在用户明确要求时保存。
 
 ## 10. 安全状态提交

@@ -15,10 +15,30 @@ PLAN_TEMPLATE = (
 )
 
 
+def extract_learning_loop_step(content, step_number):
+    section = re.search(
+        r"^## 执行学习闭环\s*$\n(?P<body>.*?)(?=^## |\Z)",
+        content,
+        re.MULTILINE | re.DOTALL,
+    )
+    if section is None:
+        raise AssertionError("missing learning loop section")
+    step = re.search(
+        rf"^{step_number}\.\s+(?P<text>.*?)(?=^\d+\.\s+|^## |\Z)",
+        section.group("body"),
+        re.MULTILINE | re.DOTALL,
+    )
+    if step is None:
+        raise AssertionError(f"missing learning loop step {step_number}")
+    return "".join(line.strip() for line in step.group("text").splitlines())
+
+
 class SkillContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.content = SKILL.read_text(encoding="utf-8")
+        cls.learning_step_3 = extract_learning_loop_step(cls.content, 3)
+        cls.learning_step_8 = extract_learning_loop_step(cls.content, 8)
 
     def test_frontmatter_has_only_name_and_description(self):
         match = re.match(r"^---\n(.*?)\n---", self.content, re.DOTALL)
@@ -108,26 +128,56 @@ class SkillContractTest(unittest.TestCase):
             "用户确认前暂停答案、评分、错因诊断和所有持久化",
             "只能展示不确定片段，并请求更清晰的局部材料或确认文本",
         ):
-            self.assertIn(phrase, self.content)
+            self.assertIn(phrase, self.learning_step_3)
+        for condition in ("不确定", "歧义", "不可读", "可能影响结论"):
+            self.assertIn(condition, self.learning_step_3)
+        self.assertRegex(
+            self.learning_step_3,
+            r"只有关键内容.*不确定.*歧义.*不可读.*影响结论时，才要求用户确认",
+        )
 
     def test_clear_reliable_material_continues_without_confirmation(self):
-        for phrase in ("先判断可辨性", "清晰且可可靠转写", "不强制等待确认"):
-            self.assertIn(phrase, self.content)
+        for phrase in (
+            "先判断可辨性",
+            "清晰且可可靠转写",
+            "不强制等待确认",
+            "直接继续诊断或批改",
+        ):
+            self.assertIn(phrase, self.learning_step_3)
         self.assertRegex(
-            self.content,
-            r"清晰且可可靠转写[\s\S]{0,80}直接继续(?:诊断|批改)",
-        )
-        self.assertRegex(
-            self.content,
-            r"只有[\s\S]{0,60}(?:不确定|歧义|不可读)[\s\S]{0,80}要求用户确认",
+            self.learning_step_3,
+            r"清晰且可可靠转写.*不强制等待确认，直接继续诊断或批改",
         )
 
-    def test_review_ends_with_correction_and_variant_plan(self):
+    def test_review_with_actionable_issue_and_transfer_uses_correction_and_variant(self):
+        for phrase in (
+            "发现可行动错因或改进点时",
+            "当前订正任务",
+            "该能力适合迁移验证时",
+            "同时说明后续变式验证",
+            "变式可安排在学生订正后",
+            "不立即给完整解答",
+        ):
+            self.assertIn(phrase, self.learning_step_8)
         self.assertRegex(
-            self.content,
-            r"复盘或批改[\s\S]{0,100}当前订正任务[\s\S]{0,100}后续变式验证",
+            self.learning_step_8,
+            r"发现可行动错因或改进点时.*当前订正任务.*"
+            r"该能力适合迁移验证时.*同时说明后续变式验证",
         )
-        self.assertIn("不得因等待订正而省略变式计划", self.content)
+
+    def test_review_without_issue_or_transfer_does_not_force_follow_up(self):
+        for phrase in (
+            "答案已完整正确",
+            "任务本身不适合变式",
+            "不得虚构订正点或强行添加变式",
+            "简短核验结论或其他合适后续结束",
+        ):
+            self.assertIn(phrase, self.learning_step_8)
+        self.assertRegex(
+            self.learning_step_8,
+            r"答案已完整正确或任务本身不适合变式时，"
+            r"不得虚构订正点或强行添加变式",
+        )
 
     def test_process_fields_are_reconciled_from_unique_completed_facts(self):
         for phrase in (

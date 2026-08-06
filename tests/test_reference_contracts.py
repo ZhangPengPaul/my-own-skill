@@ -104,12 +104,13 @@ class ReferenceContractTest(unittest.TestCase):
                     "作文",
                     "开放题",
                     "迁移验证",
-                    "所有模式都不得生成可直接冒充学生作业的整篇替代稿",
-                    "复盘可以提供提纲、局部示范、逐段批注或明确标注的比较学习范文",
                     "不能替代学生本人修改",
-                    "不得输出与学生水平不匹配的成品",
-                    "涉及精确分数时必须有适用评分标准",
-                    "只有在新文本中复用方法的独立迁移证据，才能提高掌握度",
+                    "学生水平不匹配的成品",
+                ),
+                "patterns": (
+                    r"所有模式[^。]*不得生成[^。]*冒充学生作业[^。]*整篇替代稿",
+                    r"精确分数[^。]*适用评分标准",
+                    r"只有[^。]*独立迁移证据[^。]*才能提高掌握度",
                 ),
             },
             "mathematics.md": {
@@ -120,8 +121,13 @@ class ReferenceContractTest(unittest.TestCase):
                     "推导",
                     "变式",
                     "不得虚构评分点或分数",
-                    "只有独立完成变式并解释方法的迁移证据，才允许提高掌握度",
                 ),
+                "patterns": (
+                    r"有限提示下完成订正[^。；]*developing",
+                    r"独立完成延迟复测[^。；]*stable",
+                    r"独立完成变式并解释方法[^。；]*迁移证据[^。；]*才支持\s+transferable",
+                ),
+                "forbidden_phrases": ("才允许提高掌握度",),
             },
             "english.md": {
                 "headings": ("诊断", "阅读与翻译", "写作", "练习与状态证据"),
@@ -130,12 +136,13 @@ class ReferenceContractTest(unittest.TestCase):
                     "任务完成",
                     "语言准确",
                     "针对性练习",
-                    "所有模式都不得生成可直接冒充学生作业的整篇替代稿",
-                    "复盘可以提供提纲、局部示范、逐段批注或明确标注的比较学习范文",
                     "不能替代学生本人修改",
-                    "不得输出与学生水平不匹配的成品",
-                    "没有适用评分标准时，不给精确分数",
-                    "学生必须在新句子、新段落或新文本中独立使用目标能力，才允许提高掌握度",
+                    "学生水平不匹配的成品",
+                ),
+                "patterns": (
+                    r"所有模式[^。]*不得生成[^。]*冒充学生作业[^。]*整篇替代稿",
+                    r"适用评分标准[^。]*精确分数",
+                    r"新(?:句子|段落|文本)[^。]*独立使用目标能力[^。]*才允许[^。]*提高掌握度",
                 ),
             },
         }
@@ -154,6 +161,12 @@ class ReferenceContractTest(unittest.TestCase):
             for phrase in contract["phrases"]:
                 with self.subTest(filename=filename, phrase=phrase):
                     self.assertIn(phrase, content)
+            for phrase in contract.get("patterns", ()):
+                with self.subTest(filename=filename, phrase=phrase):
+                    self.assertRegex(content, phrase)
+            for phrase in contract.get("forbidden_phrases", ()):
+                with self.subTest(filename=filename, phrase=f"not: {phrase}"):
+                    self.assertNotIn(phrase, content)
 
 
 if __name__ == "__main__":

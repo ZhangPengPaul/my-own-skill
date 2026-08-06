@@ -168,6 +168,20 @@ class ReferenceContractTest(unittest.TestCase):
                 with self.subTest(filename=filename, phrase=f"not: {phrase}"):
                     self.assertNotIn(phrase, content)
 
+    def test_humanities_references_have_operational_sections(self):
+        contracts = {
+            "politics.md": ("政策日期", "材料依据", "概念", "分点"),
+            "history.md": ("时间", "因果", "史料", "证据"),
+            "geography.md": ("空间", "图表", "尺度", "因果链"),
+        }
+
+        for filename, phrases in contracts.items():
+            reference = REFERENCE.parent / filename
+            content = reference.read_text(encoding="utf-8")
+            for phrase in phrases:
+                with self.subTest(filename=filename, phrase=phrase):
+                    self.assertIn(phrase, content)
+
 
 if __name__ == "__main__":
     unittest.main()

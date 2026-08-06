@@ -3,29 +3,44 @@
 
 import argparse
 from collections import Counter
-import json
 from pathlib import Path
 import sys
 
-from validate_student_data import ValidationError, validate_workspace
+from validate_student_data import (
+    EXPECTED_SUBJECTS,
+    ValidationError,
+    validate_workspace,
+)
+
+
+def _escape_markdown_line(value):
+    escaped = []
+    for character in value:
+        codepoint = ord(character)
+        if codepoint < 0x20 or codepoint == 0x7F:
+            escaped.append("\\u%04X" % codepoint)
+        else:
+            escaped.append(character)
+    return "".join(escaped)
 
 
 def render(workspace):
     workspace = Path(workspace)
-    validate_workspace(workspace)
-    state = json.loads((workspace / "state.json").read_text(encoding="utf-8"))
+    state = validate_workspace(workspace)
     lines = [
         "# 学习进度摘要",
         "",
         "- student_id: %s" % state["student_id"],
-        "- updated_at: %s" % (state["updated_at"] or "未记录"),
+        "- updated_at: %s"
+        % _escape_markdown_line(state["updated_at"] or "未记录"),
         "- 已完成计划项目: %d" % state["process"]["completed_plan_items"],
         "- 记录会话: %d" % state["process"]["recorded_sessions"],
         "",
         "## 学科状态",
         "",
     ]
-    for subject_name, subject in state["subjects"].items():
+    for subject_name in EXPECTED_SUBJECTS:
+        subject = state["subjects"][subject_name]
         counts = Counter(
             unit["status"] for unit in subject["knowledge_units"].values()
         )
@@ -45,7 +60,7 @@ def main():
     args = parser.parse_args()
     try:
         print(render(args.workspace), end="")
-    except (OSError, json.JSONDecodeError, ValidationError) as exc:
+    except (OSError, ValidationError) as exc:
         print("ERROR: %s" % exc, file=sys.stderr)
         return 1
     return 0

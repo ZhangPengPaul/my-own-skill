@@ -195,6 +195,7 @@ def validate_workspace(workspace):
         raise ValidationError(f"cannot read state.json: {error}") from error
 
     validate_state(state, workspace)
+    return state
 
 
 def main():

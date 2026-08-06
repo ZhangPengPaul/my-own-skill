@@ -16,7 +16,7 @@ SCRIPTS_DIR = (
 sys.path.insert(0, str(SCRIPTS_DIR))
 VALIDATOR_SCRIPT = SCRIPTS_DIR / "validate_student_data.py"
 
-from validate_student_data import ValidationError, validate_state
+from validate_student_data import ValidationError, validate_state, validate_workspace
 
 
 SUBJECTS = {
@@ -81,6 +81,16 @@ def write_complete_workspace(workspace, state, create_sessions=True):
 class ValidateStudentDataTest(unittest.TestCase):
     def test_accepts_initial_state(self):
         validate_state(valid_state())
+
+    def test_validate_workspace_returns_validated_state(self):
+        state = valid_state()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            write_complete_workspace(workspace, state)
+
+            validated_state = validate_workspace(workspace)
+
+        self.assertEqual(state, validated_state)
 
     def test_rejects_unknown_schema_version(self):
         state = valid_state()

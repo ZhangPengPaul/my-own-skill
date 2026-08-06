@@ -1,1 +1,3 @@
-/.worktrees/
+/student-workspaces/
+__pycache__/
+*.py[cod]

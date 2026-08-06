@@ -95,6 +95,19 @@ class ReferenceContractTest(unittest.TestCase):
         ):
             self.assertIn(phrase, compact)
 
+    def test_language_and_mathematics_references_have_operational_sections(self):
+        expected_phrases = {
+            "chinese.md": ("文本证据", "作文", "开放题", "迁移验证"),
+            "mathematics.md": ("第一个实质错误", "条件检查", "推导", "变式"),
+            "english.md": ("保留学生原意", "任务完成", "语言准确", "针对性练习"),
+        }
+
+        for filename, phrases in expected_phrases.items():
+            reference = REFERENCE.parent / filename
+            content = reference.read_text(encoding="utf-8")
+            for phrase in phrases:
+                self.assertIn(phrase, content)
+
 
 if __name__ == "__main__":
     unittest.main()

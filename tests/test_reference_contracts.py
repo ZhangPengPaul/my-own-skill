@@ -170,17 +170,107 @@ class ReferenceContractTest(unittest.TestCase):
 
     def test_humanities_references_have_operational_sections(self):
         contracts = {
-            "politics.md": ("政策日期", "材料依据", "概念", "分点"),
-            "history.md": ("时间", "因果", "史料", "证据"),
-            "geography.md": ("空间", "图表", "尺度", "因果链"),
+            "politics.md": {
+                "title": "政治学习与反馈",
+                "headings": ("诊断", "时效与来源", "答题组织", "练习与状态证据"),
+                "phrases": (
+                    "政策日期",
+                    "材料依据",
+                    "概念",
+                    "分点",
+                    "发布主体",
+                    "官方原文 URL 或标识",
+                    "题目材料所处日期",
+                    "本次查询日期",
+                    "单次证据不得越级",
+                ),
+                "patterns": (
+                    r"优先核验[^。]*适用辖区[^。]*官方原文",
+                    r"发布主体[^。]*发布日期[^。]*生效日期[^。]*废止日期[^。]*适用地区或对象",
+                    r"比较[^。]*材料日期[^。]*政策有效期",
+                    r"字段无法确认[^。]*不确定性[^。]*不得编造",
+                    r"不能把旧政策说成现行[^。]*不能用现行政策覆盖[^。]*历史情境",
+                    r"只有[^。]*评分细则[^。]*题目总分[^。]*要点分值分配[^。]*部分得分[^。]*必要表达要求[^。]*才给精确得分",
+                    r"参考答案[^。]*不足以[^。]*精确评分",
+                    r"否则[^。]*确定性反馈[^。]*评分不确定性",
+                    r"有限提示下完成针对性订正[^。；]*developing",
+                    r"独立完成延迟复测[^。；]*stable",
+                    r"新材料[^。；]*独立选择概念[^。；]*引用材料证据[^。；]*解释[^。；]*transferable",
+                ),
+                "forbidden_phrases": ("支持提高掌握度",),
+            },
+            "history.md": {
+                "title": "历史学习与反馈",
+                "headings": ("诊断", "史料题", "因果与评价", "练习与状态证据"),
+                "phrases": (
+                    "时间",
+                    "因果",
+                    "史料",
+                    "证据",
+                    "史料直接信息",
+                    "基于背景的推断",
+                    "无法由证据支持的结论",
+                    "后见之明",
+                    "单次证据不得越级",
+                ),
+                "patterns": (
+                    r"区分[^。]*史料作者或材料声称的内容[^。]*已证实史实",
+                    r"检查[^。]*作者[^。]*形成时间[^。]*目的[^。]*受众或情境[^。]*代表性[^。]*局限",
+                    r"重要结论[^。]*其他独立史料[^。]*互证",
+                    r"单一史料[^。]*不得超出[^。]*支持的边界",
+                    r"有限提示下完成针对性订正[^。；]*developing",
+                    r"独立完成延迟复测[^。；]*stable",
+                    r"不同时期史料[^。；]*独立选择与引用证据[^。；]*因果解释[^。；]*transferable",
+                ),
+                "forbidden_phrases": ("支持提高掌握度",),
+            },
+            "geography.md": {
+                "title": "地理学习与反馈",
+                "headings": ("诊断", "图表与材料", "过程与因果", "练习与状态证据"),
+                "phrases": (
+                    "空间",
+                    "图表",
+                    "尺度",
+                    "因果链",
+                    "相关性不能直接证明因果",
+                    "单次证据不得越级",
+                ),
+                "patterns": (
+                    r"因果解释[^。]*机制[^。]*材料依据",
+                    r"不得无依据外推[^。]*时间、空间、样本或尺度之外",
+                    r"有限提示下完成针对性订正[^。；]*developing",
+                    r"独立完成延迟复测[^。；]*stable",
+                    r"不同区域、尺度或图表[^。；]*独立选择并引用证据[^。；]*解释因果[^。；]*transferable",
+                ),
+                "forbidden_phrases": ("支持提高掌握度",),
+            },
         }
 
-        for filename, phrases in contracts.items():
+        for filename, contract in contracts.items():
             reference = REFERENCE.parent / filename
             content = reference.read_text(encoding="utf-8")
-            for phrase in phrases:
+            titles = set(
+                re.findall(r"^#[ \t]+(.+?)[ \t]*$", content, flags=re.MULTILINE)
+            )
+            headings = set(
+                re.findall(r"^##[ \t]+(.+?)[ \t]*$", content, flags=re.MULTILINE)
+            )
+
+            with self.subTest(filename=filename, phrase=f"# {contract['title']}"):
+                self.assertIn(contract["title"], titles)
+            for heading in contract["headings"]:
+                phrase = f"## {heading}"
+                with self.subTest(filename=filename, phrase=phrase):
+                    self.assertIn(heading, headings)
+            for phrase in contract["phrases"]:
                 with self.subTest(filename=filename, phrase=phrase):
                     self.assertIn(phrase, content)
+            for phrase in contract["patterns"]:
+                with self.subTest(filename=filename, phrase=phrase):
+                    self.assertRegex(content, phrase)
+            for phrase in contract["forbidden_phrases"]:
+                with self.subTest(filename=filename, phrase=f"not: {phrase}"):
+                    self.assertNotIn(phrase, content)
 
 
 if __name__ == "__main__":

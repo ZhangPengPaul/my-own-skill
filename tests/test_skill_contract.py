@@ -6,6 +6,13 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / "skills/shanghai-high-school-study-coach/SKILL.md"
 OPENAI_YAML = ROOT / "skills/shanghai-high-school-study-coach/agents/openai.yaml"
+SESSION_TEMPLATE = (
+    ROOT / "skills/shanghai-high-school-study-coach/assets/session-record-template.md"
+)
+PLAN_TEMPLATE = (
+    ROOT
+    / "skills/shanghai-high-school-study-coach/assets/student-workspace-template/plans/current.md"
+)
 
 
 class SkillContractTest(unittest.TestCase):
@@ -103,16 +110,65 @@ class SkillContractTest(unittest.TestCase):
         ):
             self.assertIn(phrase, self.content)
 
-    def test_process_fields_join_the_same_evidence_based_atomic_update(self):
+    def test_process_fields_are_reconciled_from_unique_completed_facts(self):
         for phrase in (
-            "会话记录成功落盘后",
-            "`process.recorded_sessions += 1`",
-            "只有存在完成证据的计划项才增加或重算 `completed_plan_items`",
-            "每次成功的状态变更都更新 `updated_at`",
-            "同一次候选状态原子更新",
-            "无证据或临时会话不修改这些字段",
+            "从已落盘事实对账重算",
+            "唯一稳定 `session_id`",
+            "`status: completed`",
+            "incomplete",
+            "重复 `session_id`",
+            "唯一稳定 `item_id`",
+            "完成证据存在",
+            "缺少证据或重复 `item_id`",
         ):
             self.assertIn(phrase, self.content)
+        self.assertNotIn("recorded_sessions += 1", self.content)
+        self.assertNotRegex(self.content, r"completed_plan_items\s*\+=")
+
+    def test_progress_reconciliation_and_retries_are_idempotent(self):
+        for phrase in (
+            "重试同一会话必须复用同一 `session_id`",
+            "不能生成第二条记录",
+            "同一组事实文件重复执行对账得到相同计数",
+            "忽略 `updated_at`",
+            "确有变化时才更新 `updated_at`",
+            "no-op",
+            "保留原时间戳",
+            "中断后重试从事实文件恢复，不依赖内存增量",
+        ):
+            self.assertIn(phrase, self.content)
+        facts = self.content.index("会话记录和计划记录先以同目录唯一临时文件原子替换")
+        reconciliation = self.content.index("再从已落盘事实对账重算")
+        self.assertLess(facts, reconciliation)
+
+    def test_session_and_plan_templates_define_stable_completion_records(self):
+        session = SESSION_TEMPLATE.read_text(encoding="utf-8")
+        self.assertIn("- session_id:", session)
+        self.assertIn("- status: incomplete", session)
+        for phrase in (
+            "记录完整且成功落盘",
+            "同目录唯一临时文件",
+            "原子替换",
+            "`status: completed`",
+        ):
+            self.assertIn(phrase, session)
+
+        plan = PLAN_TEMPLATE.read_text(encoding="utf-8")
+        for field in (
+            "- item_id:",
+            "- subject:",
+            "- task:",
+            "- estimated_effort:",
+            "- status:",
+            "- evidence:",
+        ):
+            self.assertIn(field, plan)
+        for phrase in (
+            "唯一稳定",
+            "`status: completed`",
+            "完成证据",
+        ):
+            self.assertIn(phrase, plan)
 
     def test_external_sharing_requires_scoped_current_authorization(self):
         for phrase in (

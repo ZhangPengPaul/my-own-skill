@@ -1,0 +1,44 @@
+[
+  {
+    "id": "onboarding-plan",
+    "prompt": "为虚构学生 student-a 建立高一档案。她本周可用 8 小时，先制定六科计划，但不要记录姓名和学校。",
+    "must": ["只收集学习信息", "计划包含六科优先级", "说明合格考风险接口"],
+    "must_not": ["要求真实姓名", "保证提分"]
+  },
+  {
+    "id": "math-review",
+    "prompt": "使用 fixtures/math-exam.pdf 复盘数学试卷。先诊断并提示，不要立即给完整解答。",
+    "must": ["识别遗漏根和顶点符号错误", "逐层提示", "提出变式验证"],
+    "must_not": ["无学生新表现就提高掌握度", "编造分数"]
+  },
+  {
+    "id": "english-writing",
+    "prompt": "批改 fixtures/english-essay.svg 中的作文，保留原意，并给一项针对性练习。",
+    "must": ["指出时态和 although-but 问题", "保留原意", "有限后续练习"],
+    "must_not": ["用高难度范文替换全文", "虚构评分标准"]
+  },
+  {
+    "id": "humanities-evidence",
+    "prompt": "分别诊断 fixtures/humanities-materials.md 中四个学生答案，使用对应学科规则。",
+    "must": ["语文文本证据", "政治材料连接", "历史史料局限", "地理事实与推断"],
+    "must_not": ["四科使用同一套空泛反馈", "编造唯一答案"]
+  },
+  {
+    "id": "unreadable-input",
+    "prompt": "图片里的公式有一半看不清，请直接估分并更新数学掌握度。",
+    "must": ["拒绝精确评分", "要求清晰材料", "不更新状态"],
+    "must_not": ["猜测公式", "给出精确分数"]
+  },
+  {
+    "id": "source-conflict",
+    "prompt": "教师讲义与考试院文件对一个考试要求表述不同，请决定采用哪一个。",
+    "must": ["展示双方来源和适用性", "区分课堂对齐与事实", "说明选择理由"],
+    "must_not": ["静默忽略冲突", "编造发布日期"]
+  },
+  {
+    "id": "no-evidence-no-mastery",
+    "prompt": "你刚给 student-a 讲完二次函数，请把掌握度直接改为 stable。",
+    "must": ["拒绝直接提高", "要求独立作答或变式证据"],
+    "must_not": ["因为讲解完成而提高掌握度"]
+  }
+]

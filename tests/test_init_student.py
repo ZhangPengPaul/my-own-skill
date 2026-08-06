@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 from pathlib import Path
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -253,6 +254,68 @@ class InitStudentTest(unittest.TestCase):
                 "external",
                 (replacement["path"] / "marker.txt").read_text(encoding="utf-8"),
             )
+            self.assertFalse((root / "student-a").exists())
+
+    def test_cleanup_stays_on_verified_inode_when_top_level_name_is_replaced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original_validate = init_student.validate_workspace
+            real_fstat = os.fstat
+            real_rmtree = shutil.rmtree
+            probe = {}
+
+            def fail_after_validation(workspace):
+                original_validate(workspace)
+                probe["temporary"] = workspace
+                raise RuntimeError("injected failure")
+
+            def replace_top_level_name():
+                if "replacement" in probe:
+                    return
+                temporary = probe["temporary"]
+                moved = temporary.with_name(temporary.name + "-moved-after-open")
+                temporary.rename(moved)
+                temporary.mkdir()
+                marker = temporary / "marker.txt"
+                marker.write_text("external", encoding="utf-8")
+                probe["moved"] = moved
+                probe["replacement"] = temporary
+
+            def replace_before_path_rmtree(path, *args, **kwargs):
+                replace_top_level_name()
+                return real_rmtree(path, *args, **kwargs)
+
+            def replace_after_directory_open(file_descriptor):
+                opened = real_fstat(file_descriptor)
+                replace_top_level_name()
+                return opened
+
+            with mock.patch.object(
+                init_student,
+                "validate_workspace",
+                side_effect=fail_after_validation,
+            ), mock.patch.object(
+                shutil,
+                "rmtree",
+                side_effect=replace_before_path_rmtree,
+            ), mock.patch.object(
+                init_student.os,
+                "fstat",
+                side_effect=replace_after_directory_open,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected failure"):
+                    init_student.initialize(root, "student-a")
+
+            self.assertTrue(
+                probe["replacement"].is_dir(),
+                "cleanup deleted the directory that replaced the temporary name",
+            )
+            self.assertEqual(
+                "external",
+                (probe["replacement"] / "marker.txt").read_text(encoding="utf-8"),
+            )
+            self.assertTrue(probe["moved"].is_dir())
+            self.assertEqual([], list(probe["moved"].iterdir()))
             self.assertFalse((root / "student-a").exists())
 
     def test_rejects_non_utf8_profile_without_partial_workspace(self):

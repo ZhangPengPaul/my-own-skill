@@ -8,7 +8,6 @@ import errno
 import json
 import os
 from pathlib import Path
-import shutil
 import stat
 import sys
 import tempfile
@@ -128,17 +127,110 @@ def _publish_no_replace(source, destination):
         _raise_publish_error(ctypes.get_errno(), destination)
 
 
-def _cleanup_owned_temporary(temporary, identity):
+def _close_no_raise(file_descriptor):
+    if file_descriptor is None:
+        return
     try:
-        current = temporary.lstat()
+        os.close(file_descriptor)
+    except BaseException:
+        pass
+
+
+def _directory_open_flags():
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise OSError(errno.ENOTSUP, "descriptor-safe directory cleanup unavailable")
+    return (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _same_identity(file_stat, identity, expected_type):
+    return (
+        expected_type(file_stat.st_mode)
+        and file_stat.st_dev == identity[0]
+        and file_stat.st_ino == identity[1]
+    )
+
+
+def _unlink_verified_file(parent_fd, name, identity):
+    file_descriptor = None
+    try:
+        flags = (
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        file_descriptor = os.open(name, flags, dir_fd=parent_fd)
+        opened = os.fstat(file_descriptor)
+        if not _same_identity(opened, identity, stat.S_ISREG):
+            return
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if _same_identity(current, identity, stat.S_ISREG):
+            os.unlink(name, dir_fd=parent_fd)
     except OSError:
         return
-    if (
-        stat.S_ISDIR(current.st_mode)
-        and current.st_dev == identity[0]
-        and current.st_ino == identity[1]
-    ):
-        shutil.rmtree(temporary, ignore_errors=True)
+    finally:
+        _close_no_raise(file_descriptor)
+
+
+def _clear_directory_fd(directory_fd):
+    for name in os.listdir(directory_fd):
+        try:
+            entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError:
+            continue
+        identity = (entry.st_dev, entry.st_ino)
+        if stat.S_ISREG(entry.st_mode):
+            _unlink_verified_file(directory_fd, name, identity)
+        elif stat.S_ISDIR(entry.st_mode):
+            _remove_verified_directory(directory_fd, name, identity)
+
+
+def _remove_verified_directory(parent_fd, name, identity):
+    directory_fd = None
+    try:
+        directory_fd = os.open(
+            name, _directory_open_flags(), dir_fd=parent_fd
+        )
+        opened = os.fstat(directory_fd)
+        if not _same_identity(opened, identity, stat.S_ISDIR):
+            return
+        _clear_directory_fd(directory_fd)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if _same_identity(current, identity, stat.S_ISDIR):
+            os.rmdir(name, dir_fd=parent_fd)
+    except OSError:
+        return
+    finally:
+        _close_no_raise(directory_fd)
+
+
+def _cleanup_owned_temporary(root, temporary_name, identity):
+    root_fd = None
+    temporary_fd = None
+    try:
+        flags = _directory_open_flags()
+        root_fd = os.open(os.fspath(root), flags)
+        temporary_fd = os.open(temporary_name, flags, dir_fd=root_fd)
+        opened = os.fstat(temporary_fd)
+        if not _same_identity(opened, identity, stat.S_ISDIR):
+            return
+
+        _clear_directory_fd(temporary_fd)
+        current = os.stat(
+            temporary_name, dir_fd=root_fd, follow_symlinks=False
+        )
+        if _same_identity(current, identity, stat.S_ISDIR):
+            os.rmdir(temporary_name, dir_fd=root_fd)
+    except BaseException:
+        return
+    finally:
+        _close_no_raise(temporary_fd)
+        _close_no_raise(root_fd)
 
 
 def initialize(root, student_id):
@@ -182,7 +274,7 @@ def initialize(root, student_id):
         published = True
     except BaseException:
         if not published and identity is not None:
-            _cleanup_owned_temporary(temporary, identity)
+            _cleanup_owned_temporary(root, temporary.name, identity)
         raise
     return destination
 

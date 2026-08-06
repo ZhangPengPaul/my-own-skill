@@ -1,4 +1,5 @@
 import copy
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -53,6 +54,28 @@ def valid_state():
             "recorded_sessions": 0,
         },
     }
+
+
+def state_with_evidence(evidence_path):
+    state = valid_state()
+    state["subjects"]["mathematics"]["knowledge_units"]["quadratic"] = {
+        "status": "developing",
+        "evidence": [evidence_path],
+        "last_reviewed_at": "2026-08-06",
+        "next_review_at": "2026-08-13",
+    }
+    return state
+
+
+def write_complete_workspace(workspace, state, create_sessions=True):
+    (workspace / "profile.md").touch()
+    (workspace / "plans").mkdir()
+    (workspace / "plans" / "current.md").touch()
+    for directory in ("mistakes", "materials"):
+        (workspace / directory).mkdir()
+    if create_sessions:
+        (workspace / "sessions").mkdir()
+    (workspace / "state.json").write_text(json.dumps(state), encoding="utf-8")
 
 
 class ValidateStudentDataTest(unittest.TestCase):
@@ -217,6 +240,85 @@ class ValidateStudentDataTest(unittest.TestCase):
             for directory in ("mistakes", "sessions", "materials"):
                 (workspace / directory).mkdir()
             (workspace / "state.json").write_bytes(b"\xff\xfe")
+
+            result = subprocess.run(
+                [sys.executable, str(VALIDATOR_SCRIPT), str(workspace)],
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(1, result.returncode)
+        self.assertTrue(
+            result.stderr.startswith("INVALID:"),
+            f"unexpected stderr: {result.stderr!r}",
+        )
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_rejects_sessions_directory_symlink_outside_workspace(self):
+        state = state_with_evidence("sessions/evidence.md")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            external_sessions = root / "external-sessions"
+            external_sessions.mkdir()
+            (external_sessions / "evidence.md").touch()
+            try:
+                (workspace / "sessions").symlink_to(
+                    external_sessions, target_is_directory=True
+                )
+            except (NotImplementedError, OSError) as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+
+            with self.assertRaisesRegex(
+                ValidationError, "evidence|path|sessions|outside"
+            ):
+                validate_state(state, workspace)
+
+    def test_cli_rejects_sessions_directory_symlink_without_traceback(self):
+        state = state_with_evidence("sessions/evidence.md")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            external_sessions = root / "external-sessions"
+            external_sessions.mkdir()
+            (external_sessions / "evidence.md").touch()
+            try:
+                (workspace / "sessions").symlink_to(
+                    external_sessions, target_is_directory=True
+                )
+            except (NotImplementedError, OSError) as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+            write_complete_workspace(workspace, state, create_sessions=False)
+
+            result = subprocess.run(
+                [sys.executable, str(VALIDATOR_SCRIPT), str(workspace)],
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(1, result.returncode)
+        self.assertTrue(
+            result.stderr.startswith("INVALID:"),
+            f"unexpected stderr: {result.stderr!r}",
+        )
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_rejects_nul_in_evidence_path_with_validation_error(self):
+        state = state_with_evidence("sessions/\x00bad.md")
+
+        with self.assertRaisesRegex(ValidationError, "evidence|path"):
+            validate_state(state)
+
+    def test_cli_rejects_nul_evidence_path_without_traceback(self):
+        state = state_with_evidence("sessions/\x00bad.md")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            write_complete_workspace(workspace, state)
 
             result = subprocess.run(
                 [sys.executable, str(VALIDATOR_SCRIPT), str(workspace)],

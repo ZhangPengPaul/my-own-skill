@@ -64,7 +64,12 @@ def validate_state(state, workspace=None):
         "subjects must contain exactly the nine supported subjects",
     )
 
-    workspace_path = Path(workspace) if workspace is not None else None
+    workspace_root = None
+    if workspace is not None:
+        try:
+            workspace_root = Path(workspace).resolve()
+        except (ValueError, OSError, RuntimeError) as error:
+            raise ValidationError(f"workspace path cannot be resolved: {error}") from error
     for subject, expected_goal_type in EXPECTED_SUBJECTS.items():
         subject_state = subjects[subject]
         require(isinstance(subject_state, dict), f"subjects.{subject} must be an object")
@@ -122,6 +127,10 @@ def validate_state(state, workspace=None):
                 )
 
             for evidence_path in evidence:
+                require(
+                    "\x00" not in evidence_path,
+                    f"{prefix}.evidence path must not contain NUL",
+                )
                 posix_path = PurePosixPath(evidence_path)
                 require(
                     not posix_path.is_absolute(),
@@ -136,11 +145,18 @@ def validate_state(state, workspace=None):
                     f"{evidence_path}",
                 )
 
-                if workspace_path is not None:
-                    sessions_root = (workspace_path / "sessions").resolve()
-                    candidate = (workspace_path / Path(*posix_path.parts)).resolve()
+                if workspace_root is not None:
+                    sessions_boundary = workspace_root / "sessions"
                     try:
-                        candidate.relative_to(sessions_root)
+                        candidate = (
+                            workspace_root / Path(*posix_path.parts)
+                        ).resolve()
+                    except (ValueError, OSError, RuntimeError) as error:
+                        raise ValidationError(
+                            f"{prefix}.evidence path cannot be resolved: {evidence_path}"
+                        ) from error
+                    try:
+                        candidate.relative_to(sessions_boundary)
                     except ValueError as error:
                         raise ValidationError(
                             f"{prefix}.evidence path is outside sessions/: {evidence_path}"

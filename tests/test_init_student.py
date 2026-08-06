@@ -287,7 +287,8 @@ class InitStudentTest(unittest.TestCase):
 
             def replace_after_directory_open(file_descriptor):
                 opened = real_fstat(file_descriptor)
-                replace_top_level_name()
+                if "temporary" in probe:
+                    replace_top_level_name()
                 return opened
 
             with mock.patch.object(
@@ -317,6 +318,123 @@ class InitStudentTest(unittest.TestCase):
             self.assertTrue(probe["moved"].is_dir())
             self.assertEqual([], list(probe["moved"].iterdir()))
             self.assertFalse((root / "student-a").exists())
+
+    def test_rejects_source_replacement_after_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "student-a"
+            original_validate = init_student.validate_workspace
+            probe = {}
+
+            def replace_after_validation(workspace):
+                original_validate(workspace)
+                moved = root / "moved-original"
+                workspace.rename(moved)
+                workspace.mkdir()
+                marker = workspace / "foreign-marker.txt"
+                marker.write_text("foreign", encoding="utf-8")
+                probe["moved"] = moved
+                probe["replacement"] = workspace
+
+            with mock.patch.object(
+                init_student,
+                "validate_workspace",
+                side_effect=replace_after_validation,
+            ):
+                with self.assertRaisesRegex(
+                    init_student.ValidationError, "identity|changed"
+                ):
+                    init_student.initialize(root, "student-a")
+
+            self.assertFalse(destination.exists())
+            self.assertEqual(
+                "foreign",
+                (probe["replacement"] / "foreign-marker.txt").read_text(
+                    encoding="utf-8"
+                ),
+            )
+            self.assertEqual([], list(probe["moved"].iterdir()))
+
+    def test_post_publish_identity_mismatch_is_rolled_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "student-a"
+            real_publish = init_student._publish_no_replace
+            probe = {}
+
+            def replace_at_publish(source, publish_destination):
+                if "replacement" not in probe:
+                    moved = root / "moved-after-precheck"
+                    source.rename(moved)
+                    source.mkdir()
+                    marker = source / "foreign-marker.txt"
+                    marker.write_text("foreign", encoding="utf-8")
+                    probe["moved"] = moved
+                    probe["replacement"] = source
+                return real_publish(source, publish_destination)
+
+            with mock.patch.object(
+                init_student,
+                "_publish_no_replace",
+                side_effect=replace_at_publish,
+            ):
+                with self.assertRaisesRegex(
+                    init_student.ValidationError, "identity|changed"
+                ):
+                    init_student.initialize(root, "student-a")
+
+            self.assertFalse(destination.exists())
+            self.assertEqual(
+                "foreign",
+                (probe["replacement"] / "foreign-marker.txt").read_text(
+                    encoding="utf-8"
+                ),
+            )
+            self.assertEqual([], list(probe["moved"].iterdir()))
+
+    def test_failed_identity_rollback_requires_manual_inspection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "student-a"
+            real_publish = init_student._publish_no_replace
+            probe = {}
+
+            def replace_and_block_rollback(source, publish_destination):
+                if "replacement" not in probe:
+                    moved = root / "moved-before-failed-rollback"
+                    source.rename(moved)
+                    source.mkdir()
+                    marker = source / "foreign-marker.txt"
+                    marker.write_text("foreign", encoding="utf-8")
+                    probe["moved"] = moved
+                    probe["replacement"] = source
+                    result = real_publish(source, publish_destination)
+                    source.mkdir()
+                    (source / "blocker.txt").write_text(
+                        "preserve", encoding="utf-8"
+                    )
+                    return result
+                return real_publish(source, publish_destination)
+
+            with mock.patch.object(
+                init_student,
+                "_publish_no_replace",
+                side_effect=replace_and_block_rollback,
+            ):
+                with self.assertRaisesRegex(
+                    init_student.ValidationError, "manual inspection|人工"
+                ):
+                    init_student.initialize(root, "student-a")
+
+            self.assertEqual(
+                "foreign",
+                (destination / "foreign-marker.txt").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                "preserve",
+                (probe["replacement"] / "blocker.txt").read_text(encoding="utf-8"),
+            )
+            self.assertEqual([], list(probe["moved"].iterdir()))
 
     def test_rejects_non_utf8_profile_without_partial_workspace(self):
         self.assert_template_error(

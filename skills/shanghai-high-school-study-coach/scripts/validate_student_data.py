@@ -3,7 +3,7 @@
 
 import argparse
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import sys
 
@@ -41,7 +41,11 @@ def require(condition, message):
 
 def validate_state(state, workspace=None):
     require(isinstance(state, dict), "state must be an object")
-    require(state.get("schema_version") == 1, "schema_version must be 1")
+    schema_version = state.get("schema_version")
+    require(
+        type(schema_version) is int and schema_version == 1,
+        "schema_version must be the integer 1",
+    )
 
     student_id = state.get("student_id")
     require(
@@ -80,8 +84,10 @@ def validate_state(state, workspace=None):
         )
 
         if expected_goal_type == "qualification":
+            qualification_risk = subject_state.get("qualification_risk")
             require(
-                subject_state.get("qualification_risk") in QUALIFICATION_RISKS,
+                isinstance(qualification_risk, str)
+                and qualification_risk in QUALIFICATION_RISKS,
                 f"subjects.{subject}.qualification_risk is invalid",
             )
         else:
@@ -93,7 +99,11 @@ def validate_state(state, workspace=None):
         for unit_name, unit in knowledge_units.items():
             prefix = f"subjects.{subject}.knowledge_units.{unit_name}"
             require(isinstance(unit, dict), f"{prefix} must be an object")
-            require(unit.get("status") in MASTERY_LEVELS, f"{prefix}.status is invalid")
+            status = unit.get("status")
+            require(
+                isinstance(status, str) and status in MASTERY_LEVELS,
+                f"{prefix}.status is invalid",
+            )
 
             evidence = unit.get("evidence")
             require(
@@ -101,7 +111,7 @@ def validate_state(state, workspace=None):
                 and all(isinstance(path, str) for path in evidence),
                 f"{prefix}.evidence must be a list of strings",
             )
-            if unit["status"] != "unassessed":
+            if status != "unassessed":
                 require(evidence, f"{prefix}.evidence is required for assessed mastery")
 
             for date_field in ("last_reviewed_at", "next_review_at"):
@@ -111,14 +121,32 @@ def validate_state(state, workspace=None):
                     f"{prefix}.{date_field} must be null or a string",
                 )
 
-            if workspace_path is not None:
-                for evidence_path in evidence:
+            for evidence_path in evidence:
+                posix_path = PurePosixPath(evidence_path)
+                require(
+                    not posix_path.is_absolute(),
+                    f"{prefix}.evidence path must be relative: {evidence_path}",
+                )
+                require(
+                    len(posix_path.parts) >= 2
+                    and posix_path.parts[0] == "sessions"
+                    and ".." not in posix_path.parts
+                    and not evidence_path.endswith("/"),
+                    f"{prefix}.evidence path must name a file inside sessions/: "
+                    f"{evidence_path}",
+                )
+
+                if workspace_path is not None:
+                    sessions_root = (workspace_path / "sessions").resolve()
+                    candidate = (workspace_path / Path(*posix_path.parts)).resolve()
+                    try:
+                        candidate.relative_to(sessions_root)
+                    except ValueError as error:
+                        raise ValidationError(
+                            f"{prefix}.evidence path is outside sessions/: {evidence_path}"
+                        ) from error
                     require(
-                        evidence_path.startswith("sessions/"),
-                        f"{prefix}.evidence path must start with sessions/: {evidence_path}",
-                    )
-                    require(
-                        (workspace_path / evidence_path).is_file(),
+                        candidate.is_file(),
                         f"{prefix}.evidence file is missing: {evidence_path}",
                     )
 
@@ -147,7 +175,7 @@ def validate_workspace(workspace):
 
     try:
         state = json.loads((workspace / "state.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ValidationError(f"cannot read state.json: {error}") from error
 
     validate_state(state, workspace)

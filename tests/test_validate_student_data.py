@@ -1,5 +1,6 @@
 import copy
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ SCRIPTS_DIR = (
     / "scripts"
 )
 sys.path.insert(0, str(SCRIPTS_DIR))
+VALIDATOR_SCRIPT = SCRIPTS_DIR / "validate_student_data.py"
 
 from validate_student_data import ValidationError, validate_state
 
@@ -121,6 +123,113 @@ class ValidateStudentDataTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValidationError, "qualification_risk"):
             validate_state(state)
+
+    def test_rejects_traversal_evidence_even_when_target_exists(self):
+        state = valid_state()
+        state["subjects"]["mathematics"]["knowledge_units"]["quadratic"] = {
+            "status": "developing",
+            "evidence": ["sessions/../../outside.md"],
+            "last_reviewed_at": "2026-08-06",
+            "next_review_at": "2026-08-13",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            (workspace / "sessions").mkdir(parents=True)
+            (root / "outside.md").touch()
+
+            with self.assertRaisesRegex(
+                ValidationError, "evidence|path|sessions|outside"
+            ):
+                validate_state(state, workspace)
+
+    def test_rejects_evidence_symlink_that_escapes_sessions(self):
+        state = valid_state()
+        state["subjects"]["mathematics"]["knowledge_units"]["quadratic"] = {
+            "status": "developing",
+            "evidence": ["sessions/escape.md"],
+            "last_reviewed_at": "2026-08-06",
+            "next_review_at": "2026-08-13",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            sessions = workspace / "sessions"
+            sessions.mkdir(parents=True)
+            outside = root / "outside.md"
+            outside.touch()
+            try:
+                (sessions / "escape.md").symlink_to(outside)
+            except (NotImplementedError, OSError) as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+
+            with self.assertRaisesRegex(
+                ValidationError, "evidence|path|sessions|outside"
+            ):
+                validate_state(state, workspace)
+
+    def test_rejects_absolute_evidence_without_workspace(self):
+        state = valid_state()
+        state["subjects"]["mathematics"]["knowledge_units"]["quadratic"] = {
+            "status": "developing",
+            "evidence": ["/tmp/outside.md"],
+            "last_reviewed_at": "2026-08-06",
+            "next_review_at": "2026-08-13",
+        }
+
+        with self.assertRaisesRegex(ValidationError, "evidence|path|sessions"):
+            validate_state(state)
+
+    def test_rejects_non_string_mastery_status_with_validation_error(self):
+        state = valid_state()
+        state["subjects"]["mathematics"]["knowledge_units"]["quadratic"] = {
+            "status": {"level": "developing"},
+            "evidence": [],
+            "last_reviewed_at": None,
+            "next_review_at": None,
+        }
+
+        with self.assertRaisesRegex(ValidationError, "status"):
+            validate_state(state)
+
+    def test_rejects_non_string_qualification_risk_with_validation_error(self):
+        state = valid_state()
+        state["subjects"]["physics"]["qualification_risk"] = ["low"]
+
+        with self.assertRaisesRegex(ValidationError, "qualification_risk"):
+            validate_state(state)
+
+    def test_rejects_boolean_schema_version(self):
+        state = valid_state()
+        state["schema_version"] = True
+
+        with self.assertRaisesRegex(ValidationError, "schema_version"):
+            validate_state(state)
+
+    def test_cli_reports_non_utf8_state_as_validation_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            (workspace / "profile.md").touch()
+            (workspace / "plans").mkdir()
+            (workspace / "plans" / "current.md").touch()
+            for directory in ("mistakes", "sessions", "materials"):
+                (workspace / directory).mkdir()
+            (workspace / "state.json").write_bytes(b"\xff\xfe")
+
+            result = subprocess.run(
+                [sys.executable, str(VALIDATOR_SCRIPT), str(workspace)],
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(1, result.returncode)
+        self.assertTrue(
+            result.stderr.startswith("INVALID:"),
+            f"unexpected stderr: {result.stderr!r}",
+        )
+        self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":

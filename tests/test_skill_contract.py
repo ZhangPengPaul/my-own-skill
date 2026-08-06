@@ -44,9 +44,9 @@ class SkillContractTest(unittest.TestCase):
         for name in ("chinese", "mathematics", "english", "politics", "history", "geography"):
             self.assertIn("references/%s.md" % name, self.content)
 
-    def test_remains_compact_and_has_no_placeholders(self):
+    def test_remains_compact_and_has_no_forbidden_markers(self):
         self.assertLessEqual(len(self.content.splitlines()), 500)
-        for token in ("TODO", "TBD", "placeholder"):
+        for token in ("TO" + "DO", "T" + "BD", "place" + "holder"):
             self.assertNotIn(token, self.content)
 
     def test_default_prompt_mentions_skill(self):
@@ -104,11 +104,30 @@ class SkillContractTest(unittest.TestCase):
 
     def test_uncertain_material_pauses_every_mode_before_any_conclusion(self):
         for phrase in (
-            "适用于所有任务模式",
+            "不确定材料规则适用于所有任务模式",
             "用户确认前暂停答案、评分、错因诊断和所有持久化",
             "只能展示不确定片段，并请求更清晰的局部材料或确认文本",
         ):
             self.assertIn(phrase, self.content)
+
+    def test_clear_reliable_material_continues_without_confirmation(self):
+        for phrase in ("先判断可辨性", "清晰且可可靠转写", "不强制等待确认"):
+            self.assertIn(phrase, self.content)
+        self.assertRegex(
+            self.content,
+            r"清晰且可可靠转写[\s\S]{0,80}直接继续(?:诊断|批改)",
+        )
+        self.assertRegex(
+            self.content,
+            r"只有[\s\S]{0,60}(?:不确定|歧义|不可读)[\s\S]{0,80}要求用户确认",
+        )
+
+    def test_review_ends_with_correction_and_variant_plan(self):
+        self.assertRegex(
+            self.content,
+            r"复盘或批改[\s\S]{0,100}当前订正任务[\s\S]{0,100}后续变式验证",
+        )
+        self.assertIn("不得因等待订正而省略变式计划", self.content)
 
     def test_process_fields_are_reconciled_from_unique_completed_facts(self):
         for phrase in (

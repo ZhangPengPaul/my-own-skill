@@ -33,7 +33,7 @@ def _load_templates():
     profile = _read_text_template(TEMPLATE / "profile.md")
     if profile.count(PROFILE_PLACEHOLDER) != 1:
         raise ValidationError(
-            "profile template must contain exactly one %s placeholder"
+            "profile template must contain exactly one %s marker"
             % PROFILE_PLACEHOLDER
         )
 

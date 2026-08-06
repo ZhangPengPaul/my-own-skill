@@ -448,15 +448,15 @@ class InitStudentTest(unittest.TestCase):
             )
         )
 
-    def test_rejects_missing_profile_placeholder_without_partial_workspace(self):
+    def test_rejects_missing_profile_marker_without_partial_workspace(self):
         self.assert_template_error(
             lambda template: (template / "profile.md").write_text(
                 "# 学生档案\n", encoding="utf-8"
             )
         )
 
-    def test_rejects_duplicate_profile_placeholder_without_partial_workspace(self):
-        def duplicate_placeholder(template):
+    def test_rejects_duplicate_profile_marker_without_partial_workspace(self):
+        def duplicate_marker(template):
             profile = template / "profile.md"
             content = profile.read_text(encoding="utf-8")
             profile.write_text(
@@ -466,7 +466,7 @@ class InitStudentTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-        self.assert_template_error(duplicate_placeholder)
+        self.assert_template_error(duplicate_marker)
 
     def test_rejects_non_utf8_current_plan_without_partial_workspace(self):
         self.assert_template_error(

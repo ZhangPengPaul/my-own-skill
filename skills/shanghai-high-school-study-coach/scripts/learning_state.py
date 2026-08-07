@@ -1,6 +1,6 @@
 """Validate structured learning facts and their evidence records."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 
 
@@ -339,3 +339,209 @@ def validate_fact(fact):
         validate_plan_fact(fact)
     else:
         raise ValidationError("record_type is invalid")
+
+
+def _active_revisions(records, stable_field, validator):
+    by_record_id = {}
+    children = {}
+    for record in records:
+        validator(record)
+        record_id = record["record_id"]
+        require(
+            record_id not in by_record_id,
+            f"duplicate record_id: {record_id}",
+        )
+        by_record_id[record_id] = record
+    for record in records:
+        parent_id = record["supersedes_record_id"]
+        if parent_id is None:
+            continue
+        require(
+            parent_id in by_record_id,
+            f"missing superseded record: {parent_id}",
+        )
+        parent = by_record_id[parent_id]
+        require(
+            parent[stable_field] == record[stable_field],
+            "revision must preserve stable id",
+        )
+        require(parent_id not in children, f"revision fork at {parent_id}")
+        children[parent_id] = record["record_id"]
+    for record in records:
+        seen = set()
+        current = record
+        while current["supersedes_record_id"] is not None:
+            require(
+                current["record_id"] not in seen,
+                "revision cycle detected",
+            )
+            seen.add(current["record_id"])
+            current = by_record_id[current["supersedes_record_id"]]
+    leaves = {}
+    for record in records:
+        if record["record_id"] not in children:
+            stable_id = record[stable_field]
+            require(
+                stable_id not in leaves,
+                f"multiple active revisions for {stable_id}",
+            )
+            leaves[stable_id] = record
+    return leaves
+
+
+def _content_status(observation):
+    if observation["outcome"] == "incorrect":
+        if observation["evidence_type"] == "initial_attempt":
+            return "suspected_gap"
+        return "confirmed_gap"
+    if (
+        observation["hint_level"] != "none"
+        or observation["evidence_type"] == "correction"
+    ):
+        return "strengthening"
+    if observation["evidence_type"] in (
+        "initial_attempt",
+        "diagnostic",
+        "variant",
+    ):
+        return "provisionally_mastered"
+    if observation["evidence_type"] == "delayed_retest":
+        return "stable"
+    return "transferable"
+
+
+def _pattern_status(observation, prior_incorrect_count):
+    if observation["outcome"] == "incorrect":
+        return "recurring" if prior_incorrect_count >= 1 else "observed_once"
+    if (
+        observation["evidence_type"] in ("delayed_retest", "transfer")
+        and observation["hint_level"] == "none"
+    ):
+        return "controlled"
+    return "improving"
+
+
+def _new_target(observation):
+    return {
+        "name": observation["target_name"],
+        "module_id": observation["module_id"],
+        "aliases": list(observation["aliases"]),
+        "status": None,
+        "evidence_ids": [],
+        "last_evidence_at": None,
+        "next_review_at": None,
+    }
+
+
+def _normalized_state(state):
+    normalized = dict(state)
+    normalized["updated_at"] = None
+    return normalized
+
+
+def reconcile_state(
+    student_id,
+    sessions,
+    plan_items,
+    previous_state=None,
+    now=None,
+):
+    _require_id(student_id, "student_id")
+    active_sessions = _active_revisions(
+        sessions,
+        "session_id",
+        validate_session_fact,
+    )
+    active_plan_items = _active_revisions(
+        plan_items,
+        "item_id",
+        validate_plan_fact,
+    )
+    completed_sessions = sorted(
+        (
+            fact
+            for fact in active_sessions.values()
+            if fact["status"] == "completed"
+        ),
+        key=lambda fact: (
+            fact["completed_at"],
+            fact["session_id"],
+            fact["record_id"],
+        ),
+    )
+    subjects = {
+        subject: {"knowledge_units": {}, "patterns": {}}
+        for subject in SUBJECTS
+    }
+    evidence_by_id = {}
+    pattern_incorrect_counts = {}
+
+    for fact in completed_sessions:
+        for observation in fact["observations"]:
+            evidence_id = observation["evidence_id"]
+            require(
+                evidence_id not in evidence_by_id,
+                f"duplicate active evidence_id: {evidence_id}",
+            )
+            evidence_by_id[evidence_id] = (fact, observation)
+            collection_name = (
+                "knowledge_units"
+                if observation["target_kind"] == "knowledge_unit"
+                else "patterns"
+            )
+            collection = subjects[fact["subject"]][collection_name]
+            target_id = observation["target_id"]
+            target = collection.setdefault(
+                target_id,
+                _new_target(observation),
+            )
+            target["name"] = observation["target_name"]
+            target["module_id"] = observation["module_id"]
+            target["aliases"] = list(observation["aliases"])
+            target["evidence_ids"].append(evidence_id)
+            target["last_evidence_at"] = fact["completed_at"]
+            target["next_review_at"] = observation["next_review_at"]
+
+            if observation["target_kind"] == "knowledge_unit":
+                target["status"] = _content_status(observation)
+            else:
+                prior_count = pattern_incorrect_counts.get(target_id, 0)
+                target["status"] = _pattern_status(observation, prior_count)
+                if observation["outcome"] == "incorrect":
+                    pattern_incorrect_counts[target_id] = prior_count + 1
+
+    completed_plan_items = 0
+    for plan_item in active_plan_items.values():
+        if plan_item["status"] != "completed":
+            continue
+        evidence = evidence_by_id.get(plan_item["completion_evidence_id"])
+        if evidence is None:
+            continue
+        session, observation = evidence
+        if (
+            session["subject"] == plan_item["subject"]
+            and observation["target_kind"] == plan_item["target_kind"]
+            and observation["target_id"] == plan_item["target_id"]
+        ):
+            completed_plan_items += 1
+
+    candidate = {
+        "schema_version": 2,
+        "student_id": student_id,
+        "updated_at": None,
+        "subjects": subjects,
+        "process": {
+            "completed_plan_items": completed_plan_items,
+            "recorded_sessions": len(completed_sessions),
+        },
+    }
+    if (
+        isinstance(previous_state, dict)
+        and _normalized_state(previous_state) == candidate
+    ):
+        return previous_state
+
+    updated_at = now or datetime.now(timezone.utc).isoformat()
+    _require_timestamp(updated_at, "now")
+    candidate["updated_at"] = updated_at
+    return candidate

@@ -42,6 +42,17 @@ def knowledge_observation(**overrides):
     return value
 
 
+def pattern_observation(**overrides):
+    value = knowledge_observation(
+        target_kind="pattern",
+        module_id="reasoning",
+        target_id="mathematics.pattern.method-selection",
+        target_name="方法选择",
+    )
+    value.update(overrides)
+    return value
+
+
 def plan_fact(**overrides):
     value = {
         "schema_version": 2,

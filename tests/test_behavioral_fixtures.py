@@ -15,12 +15,17 @@ FIXTURES = BEHAVIORAL / "fixtures"
 GENERATOR_PATH = BEHAVIORAL / "generate_fixtures.py"
 FIXTURE_NAMES = ("math-exam.pdf", "english-essay.svg")
 EXPECTED_IDS = {
-    "onboarding-plan",
-    "math-review",
+    "math-guided-diagnosis",
+    "math-direct-explanation",
     "english-writing",
-    "humanities-evidence",
+    "chinese-text-evidence",
+    "politics-material-link",
+    "history-source-limits",
+    "geography-fact-versus-inference",
+    "single-error-needs-confirmation",
+    "reinforcement-and-delayed-retest",
+    "multi-weakness-priority",
     "unreadable-input",
-    "source-conflict",
     "no-evidence-no-mastery",
 }
 MATH_LINES = (
@@ -144,7 +149,7 @@ class BehavioralFixtureTest(unittest.TestCase):
     def test_case_catalog_has_strict_phase_one_schema(self):
         cases = json.loads((BEHAVIORAL / "cases.json").read_text(encoding="utf-8"))
         self.assertIs(type(cases), list)
-        self.assertEqual(7, len(cases))
+        self.assertEqual(12, len(cases))
 
         ids = set()
         for index, case in enumerate(cases):
@@ -173,30 +178,28 @@ class BehavioralFixtureTest(unittest.TestCase):
 
         self.assertEqual(EXPECTED_IDS, ids)
 
-    def test_source_conflict_case_is_fictional_and_reproducible(self):
+    def test_every_phase_one_subject_appears_in_a_prompt(self):
         cases = json.loads((BEHAVIORAL / "cases.json").read_text(encoding="utf-8"))
-        source_conflict = next(case for case in cases if case["id"] == "source-conflict")
-        for marker in (
-            "以下均为虚构材料",
-            "教师讲义A",
-            "2026-02-10",
-            "本校课堂练习适用",
-            "课堂口径A",
-            "考试院文件B",
-            "2025-11-28",
-            "2026年全市正式考试适用",
-            "正式考试口径B",
-            "课堂练习",
-            "正式考试",
-        ):
-            with self.subTest(marker=marker):
-                self.assertIn(marker, source_conflict["prompt"])
-        self.assertEqual(
-            ["展示双方来源和适用性", "区分课堂对齐与事实", "说明选择理由"],
-            source_conflict["must"],
+        prompts = "\n".join(case["prompt"] for case in cases)
+        for subject in ("语文", "数学", "英语", "政治", "历史", "地理"):
+            with self.subTest(subject=subject):
+                self.assertIn(subject, prompts)
+
+    def test_direct_answer_case_requires_complete_explanation(self):
+        cases = json.loads((BEHAVIORAL / "cases.json").read_text(encoding="utf-8"))
+        direct = next(
+            case for case in cases if case["id"] == "math-direct-explanation"
         )
-        for forbidden in ("静默忽略冲突", "编造发布日期", "把虚构材料当成真实政策"):
-            self.assertIn(forbidden, source_conflict["must_not"])
+        for outcome in (
+            "方法选择理由",
+            "完整推导",
+            "易错点",
+            "结果验证",
+            "理解检查",
+        ):
+            with self.subTest(outcome=outcome):
+                self.assertIn(outcome, direct["must"])
+        self.assertIn("因为提供了解析而更新掌握状态", direct["must_not"])
 
 
 if __name__ == "__main__":

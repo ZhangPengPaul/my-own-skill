@@ -5,343 +5,272 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
-SCRIPTS_DIR = (
-    Path(__file__).resolve().parents[1]
-    / "skills"
-    / "shanghai-high-school-study-coach"
-    / "scripts"
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "skills/shanghai-high-school-study-coach/scripts"
+VALIDATOR_SCRIPT = SCRIPTS / "validate_student_data.py"
+sys.path.insert(0, str(SCRIPTS))
+
+import validate_student_data  # noqa: E402
+from validate_student_data import (  # noqa: E402
+    ValidationError,
+    WorkspaceSnapshot,
+    validate_state,
+    validate_workspace,
 )
-sys.path.insert(0, str(SCRIPTS_DIR))
-VALIDATOR_SCRIPT = SCRIPTS_DIR / "validate_student_data.py"
-
-from validate_student_data import ValidationError, validate_state, validate_workspace
-
-
-SUBJECTS = {
-    "chinese": "high-stakes",
-    "mathematics": "high-stakes",
-    "english": "high-stakes",
-    "politics": "high-stakes",
-    "history": "high-stakes",
-    "geography": "high-stakes",
-    "physics": "qualification",
-    "chemistry": "qualification",
-    "biology": "qualification",
-}
-
-
-def valid_state():
-    subjects = {}
-    for subject, goal_type in SUBJECTS.items():
-        data = {
-            "goal_type": goal_type,
-            "assessments": [],
-            "knowledge_units": {},
-        }
-        if goal_type == "qualification":
-            data["qualification_risk"] = "unassessed"
-        subjects[subject] = data
-
-    return {
-        "schema_version": 1,
-        "student_id": "student-a",
-        "updated_at": None,
-        "subjects": subjects,
-        "process": {
-            "completed_plan_items": 0,
-            "recorded_sessions": 0,
-        },
-    }
-
-
-def state_with_evidence(evidence_path):
-    state = valid_state()
-    state["subjects"]["mathematics"]["knowledge_units"]["quadratic"] = {
-        "status": "developing",
-        "evidence": [evidence_path],
-        "last_reviewed_at": "2026-08-06",
-        "next_review_at": "2026-08-13",
-    }
-    return state
-
-
-def write_complete_workspace(workspace, state, create_sessions=True):
-    (workspace / "profile.md").touch()
-    (workspace / "plans").mkdir()
-    (workspace / "plans" / "current.md").touch()
-    for directory in ("mistakes", "materials"):
-        (workspace / directory).mkdir()
-    if create_sessions:
-        (workspace / "sessions").mkdir()
-    (workspace / "state.json").write_text(json.dumps(state), encoding="utf-8")
+from tests.workspace_fixtures import (  # noqa: E402
+    create_workspace,
+    knowledge_observation,
+    plan_fact,
+    session_fact,
+    state_from_facts,
+)
 
 
 class ValidateStudentDataTest(unittest.TestCase):
-    def test_accepts_initial_state(self):
-        validate_state(valid_state())
+    def run_validator(self, workspace):
+        return subprocess.run(
+            [sys.executable, str(VALIDATOR_SCRIPT), str(workspace)],
+            capture_output=True,
+            text=True,
+        )
 
-    def test_validate_workspace_returns_validated_state(self):
-        state = valid_state()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace = Path(temp_dir)
-            write_complete_workspace(workspace, state)
-
-            validated_state = validate_workspace(workspace)
-
-        self.assertEqual(state, validated_state)
-
-    def test_rejects_unknown_schema_version(self):
-        state = valid_state()
-        state["schema_version"] = 2
-
-        with self.assertRaisesRegex(ValidationError, "schema_version"):
-            validate_state(state)
-
-    def test_rejects_missing_subject(self):
-        state = valid_state()
-        del state["subjects"]["geography"]
-
-        with self.assertRaisesRegex(ValidationError, "subjects"):
-            validate_state(state)
-
-    def test_requires_evidence_for_mastery(self):
-        state = valid_state()
-        state["subjects"]["mathematics"]["knowledge_units"]["quadratic"] = {
-            "status": "stable",
-            "evidence": [],
-            "last_reviewed_at": None,
-            "next_review_at": None,
-        }
-
-        with self.assertRaisesRegex(ValidationError, "evidence"):
-            validate_state(state)
-
-    def test_accepts_existing_session_evidence(self):
-        state = valid_state()
-        state["subjects"]["mathematics"]["knowledge_units"]["quadratic"] = {
-            "status": "developing",
-            "evidence": ["sessions/2026-08-06-mathematics-s1.md"],
-            "last_reviewed_at": "2026-08-06",
-            "next_review_at": "2026-08-13",
-        }
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace = Path(temp_dir)
-            (workspace / "sessions").mkdir()
-            (workspace / "sessions" / "2026-08-06-mathematics-s1.md").touch()
-
-            validate_state(state, workspace)
-
-    def test_rejects_nonexistent_evidence_path(self):
-        state = copy.deepcopy(valid_state())
-        state["subjects"]["mathematics"]["knowledge_units"]["quadratic"] = {
-            "status": "developing",
-            "evidence": ["sessions/missing.md"],
-            "last_reviewed_at": "2026-08-06",
-            "next_review_at": "2026-08-13",
-        }
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace = Path(temp_dir)
-            (workspace / "sessions").mkdir()
-
-            with self.assertRaisesRegex(ValidationError, "missing"):
-                validate_state(state, workspace)
-
-    def test_rejects_qualification_risk_on_high_stakes_subject(self):
-        state = valid_state()
-        state["subjects"]["english"]["qualification_risk"] = "low"
-
-        with self.assertRaisesRegex(ValidationError, "qualification_risk"):
-            validate_state(state)
-
-    def test_rejects_traversal_evidence_even_when_target_exists(self):
-        state = valid_state()
-        state["subjects"]["mathematics"]["knowledge_units"]["quadratic"] = {
-            "status": "developing",
-            "evidence": ["sessions/../../outside.md"],
-            "last_reviewed_at": "2026-08-06",
-            "next_review_at": "2026-08-13",
-        }
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            workspace = root / "workspace"
-            (workspace / "sessions").mkdir(parents=True)
-            (root / "outside.md").touch()
-
-            with self.assertRaisesRegex(
-                ValidationError, "evidence|path|sessions|outside"
-            ):
-                validate_state(state, workspace)
-
-    def test_rejects_evidence_symlink_that_escapes_sessions(self):
-        state = valid_state()
-        state["subjects"]["mathematics"]["knowledge_units"]["quadratic"] = {
-            "status": "developing",
-            "evidence": ["sessions/escape.md"],
-            "last_reviewed_at": "2026-08-06",
-            "next_review_at": "2026-08-13",
-        }
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            workspace = root / "workspace"
-            sessions = workspace / "sessions"
-            sessions.mkdir(parents=True)
-            outside = root / "outside.md"
-            outside.touch()
-            try:
-                (sessions / "escape.md").symlink_to(outside)
-            except (NotImplementedError, OSError) as error:
-                self.skipTest(f"symlinks are unavailable: {error}")
-
-            with self.assertRaisesRegex(
-                ValidationError, "evidence|path|sessions|outside"
-            ):
-                validate_state(state, workspace)
-
-    def test_rejects_absolute_evidence_without_workspace(self):
-        state = valid_state()
-        state["subjects"]["mathematics"]["knowledge_units"]["quadratic"] = {
-            "status": "developing",
-            "evidence": ["/tmp/outside.md"],
-            "last_reviewed_at": "2026-08-06",
-            "next_review_at": "2026-08-13",
-        }
-
-        with self.assertRaisesRegex(ValidationError, "evidence|path|sessions"):
-            validate_state(state)
-
-    def test_rejects_non_string_mastery_status_with_validation_error(self):
-        state = valid_state()
-        state["subjects"]["mathematics"]["knowledge_units"]["quadratic"] = {
-            "status": {"level": "developing"},
-            "evidence": [],
-            "last_reviewed_at": None,
-            "next_review_at": None,
-        }
-
-        with self.assertRaisesRegex(ValidationError, "status"):
-            validate_state(state)
-
-    def test_rejects_non_string_qualification_risk_with_validation_error(self):
-        state = valid_state()
-        state["subjects"]["physics"]["qualification_risk"] = ["low"]
-
-        with self.assertRaisesRegex(ValidationError, "qualification_risk"):
-            validate_state(state)
-
-    def test_rejects_boolean_schema_version(self):
-        state = valid_state()
-        state["schema_version"] = True
-
-        with self.assertRaisesRegex(ValidationError, "schema_version"):
-            validate_state(state)
-
-    def test_cli_reports_non_utf8_state_as_validation_error(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace = Path(temp_dir)
-            (workspace / "profile.md").touch()
-            (workspace / "plans").mkdir()
-            (workspace / "plans" / "current.md").touch()
-            for directory in ("mistakes", "sessions", "materials"):
-                (workspace / directory).mkdir()
-            (workspace / "state.json").write_bytes(b"\xff\xfe")
-
-            result = subprocess.run(
-                [sys.executable, str(VALIDATOR_SCRIPT), str(workspace)],
-                capture_output=True,
-                text=True,
-            )
-
-        self.assertEqual(1, result.returncode)
+    def assert_cli_invalid(self, workspace):
+        result = self.run_validator(workspace)
+        self.assertEqual(1, result.returncode, result.stdout)
         self.assertTrue(
             result.stderr.startswith("INVALID:"),
             f"unexpected stderr: {result.stderr!r}",
         )
         self.assertNotIn("Traceback", result.stderr)
 
-    def test_rejects_sessions_directory_symlink_outside_workspace(self):
-        state = state_with_evidence("sessions/evidence.md")
+    def test_accepts_empty_schema_v2_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            expected = create_workspace(workspace)
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            external_sessions = root / "external-sessions"
-            external_sessions.mkdir()
-            (external_sessions / "evidence.md").touch()
-            try:
-                (workspace / "sessions").symlink_to(
-                    external_sessions, target_is_directory=True
-                )
-            except (NotImplementedError, OSError) as error:
-                self.skipTest(f"symlinks are unavailable: {error}")
+            snapshot = validate_workspace(workspace)
+
+        self.assertIsInstance(snapshot, WorkspaceSnapshot)
+        self.assertEqual(expected, snapshot.state)
+        self.assertEqual((), snapshot.sessions)
+        self.assertEqual((), snapshot.plan_items)
+
+    def test_accepts_state_derived_from_active_facts(self):
+        session = session_fact(observations=[knowledge_observation()])
+        plan = plan_fact()
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            expected = create_workspace(
+                workspace,
+                sessions=[session],
+                plan_items=[plan],
+            )
+
+            snapshot = validate_workspace(workspace)
+
+        self.assertEqual(expected, snapshot.state)
+        self.assertEqual((session,), snapshot.sessions)
+        self.assertEqual((plan,), snapshot.plan_items)
+
+    def test_validate_state_accepts_matching_facts(self):
+        session = session_fact(observations=[knowledge_observation()])
+        state = state_from_facts(sessions=[session])
+
+        validate_state(state, [session], [])
+
+    def test_read_failure_is_reported_as_validation_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace)
+            with mock.patch.object(
+                validate_student_data.os,
+                "read",
+                side_effect=OSError("fictional read failure"),
+            ):
+                with self.assertRaisesRegex(
+                    ValidationError, "profile.md.*fictional read failure"
+                ):
+                    validate_workspace(workspace)
+
+    def test_rejects_symlinked_required_children_in_empty_workspace(self):
+        for relative, is_directory in (
+            ("profile.md", False),
+            ("state.json", False),
+            (".workspace.lock", False),
+            ("sessions", True),
+            ("plan-items", True),
+            ("summaries", True),
+            ("materials", True),
+        ):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "student-a"
+                create_workspace(workspace)
+                target = workspace / relative
+                outside = root / ("outside-dir" if is_directory else "outside-file")
+                if is_directory:
+                    outside.mkdir()
+                    target.rmdir()
+                else:
+                    outside.write_text("outside", encoding="utf-8")
+                    target.unlink()
+                try:
+                    target.symlink_to(outside, target_is_directory=is_directory)
+                except (NotImplementedError, OSError) as error:
+                    self.skipTest(f"symlinks are unavailable: {error}")
+
+                with self.assertRaisesRegex(
+                    ValidationError, "symlink|regular|directory|invalid type"
+                ):
+                    validate_workspace(workspace)
+
+    def test_rejects_state_not_derived_from_active_facts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace)
+            state_path = workspace / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["process"]["recorded_sessions"] = 9
+            state_path.write_text(json.dumps(state), encoding="utf-8")
 
             with self.assertRaisesRegex(
-                ValidationError, "evidence|path|sessions|outside"
+                ValidationError, "derived|reconcile|recorded_sessions|process"
             ):
-                validate_state(state, workspace)
+                validate_workspace(workspace)
 
-    def test_cli_rejects_sessions_directory_symlink_without_traceback(self):
-        state = state_with_evidence("sessions/evidence.md")
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            external_sessions = root / "external-sessions"
-            external_sessions.mkdir()
-            (external_sessions / "evidence.md").touch()
+    def test_rejects_symlinked_session_fact(self):
+        session = session_fact(observations=[knowledge_observation()])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "student-a"
+            create_workspace(workspace)
+            outside = root / "outside.json"
+            outside.write_text(json.dumps(session), encoding="utf-8")
+            link = workspace / "sessions/record-session-001.json"
             try:
-                (workspace / "sessions").symlink_to(
-                    external_sessions, target_is_directory=True
-                )
+                link.symlink_to(outside)
             except (NotImplementedError, OSError) as error:
                 self.skipTest(f"symlinks are unavailable: {error}")
-            write_complete_workspace(workspace, state, create_sessions=False)
 
-            result = subprocess.run(
-                [sys.executable, str(VALIDATOR_SCRIPT), str(workspace)],
-                capture_output=True,
-                text=True,
-            )
+            with self.assertRaisesRegex(ValidationError, "invalid type|symlink"):
+                validate_workspace(workspace)
 
-        self.assertEqual(1, result.returncode)
-        self.assertTrue(
-            result.stderr.startswith("INVALID:"),
-            f"unexpected stderr: {result.stderr!r}",
+    def test_rejects_non_utf8_session_fact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace)
+            (workspace / "sessions/record-session-001.json").write_bytes(b"\xff\xfe")
+
+            with self.assertRaisesRegex(ValidationError, "UTF-8"):
+                validate_workspace(workspace)
+
+    def test_rejects_plan_record_in_sessions_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace)
+            path = workspace / "sessions/record-plan-001.json"
+            path.write_text(json.dumps(plan_fact()), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValidationError, "record_type"):
+                validate_workspace(workspace)
+
+    def test_rejects_state_evidence_not_present_in_active_facts(self):
+        session = session_fact(observations=[knowledge_observation()])
+        state = state_from_facts(sessions=[session])
+        state = copy.deepcopy(state)
+        target = state["subjects"]["mathematics"]["knowledge_units"][
+            "mathematics.geometry.dihedral-angle"
+        ]
+        target["evidence_ids"].append("evidence-missing")
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace, sessions=[session], state=state)
+
+            with self.assertRaisesRegex(ValidationError, "derived|evidence|subjects"):
+                validate_workspace(workspace)
+
+    def test_rejects_non_json_entry_in_fact_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace)
+            (workspace / "sessions/note.txt").write_text("not a fact", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValidationError, "JSON|json|entry"):
+                validate_workspace(workspace)
+
+    def test_cli_reports_invalid_workspace_without_traceback(self):
+        mutations = (
+            "counter",
+            "non-utf8-session",
+            "required-child-symlink",
+            "session-fact-symlink",
+            "wrong-record-type",
+            "missing-evidence",
+            "non-json-entry",
         )
-        self.assertNotIn("Traceback", result.stderr)
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "student-a"
+                create_workspace(workspace)
+                if mutation == "counter":
+                    state_path = workspace / "state.json"
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    state["process"]["recorded_sessions"] = 1
+                    state_path.write_text(json.dumps(state), encoding="utf-8")
+                elif mutation == "non-utf8-session":
+                    (workspace / "sessions/bad.json").write_bytes(b"\xff\xfe")
+                elif mutation == "required-child-symlink":
+                    target = workspace / "summaries"
+                    target.rmdir()
+                    outside = root / "outside-summaries"
+                    outside.mkdir()
+                    try:
+                        target.symlink_to(outside, target_is_directory=True)
+                    except (NotImplementedError, OSError) as error:
+                        self.skipTest(f"symlinks are unavailable: {error}")
+                elif mutation == "session-fact-symlink":
+                    outside = root / "outside-session.json"
+                    outside.write_text(
+                        json.dumps(session_fact()),
+                        encoding="utf-8",
+                    )
+                    try:
+                        (workspace / "sessions/record-session-001.json").symlink_to(
+                            outside
+                        )
+                    except (NotImplementedError, OSError) as error:
+                        self.skipTest(f"symlinks are unavailable: {error}")
+                elif mutation == "wrong-record-type":
+                    (workspace / "sessions/record-plan-001.json").write_text(
+                        json.dumps(plan_fact()),
+                        encoding="utf-8",
+                    )
+                elif mutation == "missing-evidence":
+                    session = session_fact(observations=[knowledge_observation()])
+                    (workspace / "sessions/record-session-001.json").write_text(
+                        json.dumps(session),
+                        encoding="utf-8",
+                    )
+                    state = state_from_facts(sessions=[session])
+                    target = state["subjects"]["mathematics"][
+                        "knowledge_units"
+                    ]["mathematics.geometry.dihedral-angle"]
+                    target["evidence_ids"].append("evidence-missing")
+                    (workspace / "state.json").write_text(
+                        json.dumps(state),
+                        encoding="utf-8",
+                    )
+                else:
+                    (workspace / "sessions/note.txt").write_text(
+                        "not a fact",
+                        encoding="utf-8",
+                    )
 
-    def test_rejects_nul_in_evidence_path_with_validation_error(self):
-        state = state_with_evidence("sessions/\x00bad.md")
-
-        with self.assertRaisesRegex(ValidationError, "evidence|path"):
-            validate_state(state)
-
-    def test_cli_rejects_nul_evidence_path_without_traceback(self):
-        state = state_with_evidence("sessions/\x00bad.md")
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace = Path(temp_dir)
-            write_complete_workspace(workspace, state)
-
-            result = subprocess.run(
-                [sys.executable, str(VALIDATOR_SCRIPT), str(workspace)],
-                capture_output=True,
-                text=True,
-            )
-
-        self.assertEqual(1, result.returncode)
-        self.assertTrue(
-            result.stderr.startswith("INVALID:"),
-            f"unexpected stderr: {result.stderr!r}",
-        )
-        self.assertNotIn("Traceback", result.stderr)
+                self.assert_cli_invalid(workspace)
 
 
 if __name__ == "__main__":

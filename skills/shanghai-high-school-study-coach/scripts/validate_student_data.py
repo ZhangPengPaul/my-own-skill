@@ -1,214 +1,262 @@
 #!/usr/bin/env python3
-"""Validate a Shanghai high-school study coach student workspace."""
+"""Validate a study-coach workspace through held directory descriptors."""
 
 import argparse
+from dataclasses import dataclass
 import json
-from pathlib import Path, PurePosixPath
+import os
+from pathlib import Path
 import re
+import stat
 import sys
 
+from learning_state import (
+    SUBJECTS,
+    ValidationError,
+    reconcile_state,
+    require,
+    validate_plan_fact,
+    validate_session_fact,
+)
 
-EXPECTED_SUBJECTS = {
-    "chinese": "high-stakes",
-    "mathematics": "high-stakes",
-    "english": "high-stakes",
-    "politics": "high-stakes",
-    "history": "high-stakes",
-    "geography": "high-stakes",
-    "physics": "qualification",
-    "chemistry": "qualification",
-    "biology": "qualification",
-}
-MASTERY_LEVELS = {
-    "unassessed",
-    "emerging",
-    "developing",
-    "stable",
-    "transferable",
-}
-QUALIFICATION_RISKS = {"unassessed", "low", "medium", "high"}
+
 STUDENT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+REQUIRED_REGULAR_FILES = ("profile.md", "state.json", ".workspace.lock")
+REQUIRED_DIRECTORIES = ("sessions", "plan-items", "summaries", "materials")
 
 
-class ValidationError(ValueError):
-    """Raised when student data does not satisfy the workspace contract."""
+@dataclass(frozen=True)
+class WorkspaceSnapshot:
+    state: dict
+    sessions: tuple
+    plan_items: tuple
 
 
-def require(condition, message):
-    if not condition:
-        raise ValidationError(message)
-
-
-def validate_state(state, workspace=None):
-    require(isinstance(state, dict), "state must be an object")
-    schema_version = state.get("schema_version")
+def _directory_flags():
     require(
-        type(schema_version) is int and schema_version == 1,
-        "schema_version must be the integer 1",
+        hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW"),
+        "descriptor-safe workspace access is unavailable",
+    )
+    return (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
     )
 
-    student_id = state.get("student_id")
+
+def _regular_flags(writable=False):
     require(
-        isinstance(student_id, str) and STUDENT_ID.fullmatch(student_id),
+        hasattr(os, "O_NOFOLLOW"),
+        "descriptor-safe workspace access is unavailable",
+    )
+    access = os.O_RDWR if writable else os.O_RDONLY
+    return access | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _open_child(parent_fd, name, expected_directory, writable=False):
+    expected = stat.S_ISDIR if expected_directory else stat.S_ISREG
+    expected_label = "directory" if expected_directory else "regular file"
+    try:
+        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise ValidationError(f"required child cannot be inspected: {name}: {error}") from error
+    require(
+        expected(entry.st_mode),
+        f"required child has invalid type; expected {expected_label}: {name}",
+    )
+    flags = _directory_flags() if expected_directory else _regular_flags(writable)
+    try:
+        child_fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as error:
+        raise ValidationError(f"required child cannot be opened: {name}: {error}") from error
+    try:
+        opened = os.fstat(child_fd)
+        require(
+            expected(opened.st_mode)
+            and (opened.st_dev, opened.st_ino) == (entry.st_dev, entry.st_ino),
+            f"required child identity changed: {name}",
+        )
+    except BaseException:
+        os.close(child_fd)
+        raise
+    return child_fd
+
+
+def _open_existing_regular(parent_fd, name, writable=False):
+    """Open one verified regular child without following symlinks."""
+    return _open_child(parent_fd, name, False, writable=writable)
+
+
+def _open_existing_directory(parent_fd, name):
+    """Open one verified directory child without following symlinks."""
+    return _open_child(parent_fd, name, True)
+
+
+def _read_all(file_fd):
+    chunks = []
+    while True:
+        chunk = os.read(file_fd, 65536)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _read_utf8(file_fd, label):
+    try:
+        return _read_all(file_fd).decode("utf-8")
+    except OSError as error:
+        raise ValidationError(f"cannot read {label}: {error}") from error
+    except UnicodeError as error:
+        raise ValidationError(f"{label} is not valid UTF-8") from error
+
+
+def _read_json_fd(file_fd, label):
+    text = _read_utf8(file_fd, label)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ValidationError(f"{label} is not valid JSON: {error}") from error
+
+
+def _read_fact_directory(directory_fd, label, validator, record_type):
+    try:
+        names = sorted(os.listdir(directory_fd))
+    except OSError as error:
+        raise ValidationError(f"cannot enumerate {label}: {error}") from error
+    facts = []
+    for name in names:
+        require(name.endswith(".json"), f"invalid non-JSON entry in {label}: {name}")
+        file_fd = _open_existing_regular(directory_fd, name)
+        try:
+            fact = _read_json_fd(file_fd, f"{label}/{name}")
+        finally:
+            os.close(file_fd)
+        require(
+            fact.get("record_type") == record_type,
+            f"record_type is invalid for {label}/{name}",
+        )
+        validator(fact)
+        facts.append(fact)
+    return tuple(facts)
+
+
+def _first_state_mismatch(state, candidate):
+    ordered = ("schema_version", "student_id", "updated_at", "subjects", "process")
+    for field in ordered:
+        if state.get(field) != candidate.get(field):
+            return field
+    if set(state) != set(candidate):
+        return "fields"
+    return None
+
+
+def validate_state(state, sessions, plan_items):
+    """Validate schema-v2 shape, evidence references, and derived consistency."""
+    require(isinstance(state, dict), "state must be an object")
+    require(
+        set(state) == {"schema_version", "student_id", "updated_at", "subjects", "process"},
+        "state fields are invalid",
+    )
+    require(
+        type(state.get("schema_version")) is int and state["schema_version"] == 2,
+        "schema_version must be the integer 2",
+    )
+    require(
+        isinstance(state.get("student_id"), str)
+        and STUDENT_ID.fullmatch(state["student_id"]),
         "student_id must use lowercase letters, digits, and hyphens",
     )
     require(
-        state.get("updated_at") is None or isinstance(state.get("updated_at"), str),
-        "updated_at must be null or a string",
+        isinstance(state.get("updated_at"), str) and state["updated_at"].strip(),
+        "updated_at must be an ISO-8601 timestamp",
     )
+    require(isinstance(state.get("subjects"), dict), "subjects must be an object")
+    require(set(state["subjects"]) == set(SUBJECTS), "subjects must contain exactly six subjects")
+    require(isinstance(state.get("process"), dict), "process must be an object")
 
-    subjects = state.get("subjects")
-    require(isinstance(subjects, dict), "subjects must be an object")
-    require(
-        set(subjects) == set(EXPECTED_SUBJECTS),
-        "subjects must contain exactly the nine supported subjects",
+    candidate = reconcile_state(
+        state["student_id"],
+        list(sessions),
+        list(plan_items),
+        now=state["updated_at"],
     )
+    mismatch = _first_state_mismatch(state, candidate)
+    require(mismatch is None, f"state is not derived from active facts: {mismatch}")
+    return state
 
-    workspace_root = None
-    if workspace is not None:
-        try:
-            workspace_root = Path(workspace).resolve()
-        except (ValueError, OSError, RuntimeError) as error:
-            raise ValidationError(f"workspace path cannot be resolved: {error}") from error
-    for subject, expected_goal_type in EXPECTED_SUBJECTS.items():
-        subject_state = subjects[subject]
-        require(isinstance(subject_state, dict), f"subjects.{subject} must be an object")
-        require(
-            subject_state.get("goal_type") == expected_goal_type,
-            f"subjects.{subject}.goal_type must be {expected_goal_type}",
+
+def open_workspace_descriptor(workspace):
+    """Resolve once and return a no-follow directory descriptor."""
+    try:
+        resolved = Path(workspace).resolve(strict=True)
+        return os.open(os.fspath(resolved), _directory_flags())
+    except (OSError, RuntimeError) as error:
+        raise ValidationError(f"workspace cannot be opened: {error}") from error
+
+
+def read_workspace_snapshot_fd(root_fd, require_consistent_state=True):
+    """Read all required children relative to a held workspace descriptor."""
+    opened_files = []
+    opened_directories = []
+    try:
+        for name in REQUIRED_REGULAR_FILES:
+            opened_files.append((name, _open_existing_regular(root_fd, name)))
+        for name in REQUIRED_DIRECTORIES:
+            opened_directories.append((name, _open_existing_directory(root_fd, name)))
+
+        file_descriptors = dict(opened_files)
+        directory_descriptors = dict(opened_directories)
+        _read_utf8(file_descriptors["profile.md"], "profile.md")
+        state = _read_json_fd(file_descriptors["state.json"], "state.json")
+        sessions = _read_fact_directory(
+            directory_descriptors["sessions"],
+            "sessions",
+            validate_session_fact,
+            "session",
         )
-        require(
-            isinstance(subject_state.get("assessments"), list),
-            f"subjects.{subject}.assessments must be a list",
+        plan_items = _read_fact_directory(
+            directory_descriptors["plan-items"],
+            "plan-items",
+            validate_plan_fact,
+            "plan_item",
         )
+        if require_consistent_state:
+            validate_state(state, sessions, plan_items)
+        return WorkspaceSnapshot(state, sessions, plan_items)
+    finally:
+        for _, file_fd in opened_files:
+            os.close(file_fd)
+        for _, directory_fd in opened_directories:
+            os.close(directory_fd)
 
-        knowledge_units = subject_state.get("knowledge_units")
-        require(
-            isinstance(knowledge_units, dict),
-            f"subjects.{subject}.knowledge_units must be an object",
-        )
 
-        if expected_goal_type == "qualification":
-            qualification_risk = subject_state.get("qualification_risk")
-            require(
-                isinstance(qualification_risk, str)
-                and qualification_risk in QUALIFICATION_RISKS,
-                f"subjects.{subject}.qualification_risk is invalid",
-            )
-        else:
-            require(
-                "qualification_risk" not in subject_state,
-                f"subjects.{subject}.qualification_risk is not allowed",
-            )
-
-        for unit_name, unit in knowledge_units.items():
-            prefix = f"subjects.{subject}.knowledge_units.{unit_name}"
-            require(isinstance(unit, dict), f"{prefix} must be an object")
-            status = unit.get("status")
-            require(
-                isinstance(status, str) and status in MASTERY_LEVELS,
-                f"{prefix}.status is invalid",
-            )
-
-            evidence = unit.get("evidence")
-            require(
-                isinstance(evidence, list)
-                and all(isinstance(path, str) for path in evidence),
-                f"{prefix}.evidence must be a list of strings",
-            )
-            if status != "unassessed":
-                require(evidence, f"{prefix}.evidence is required for assessed mastery")
-
-            for date_field in ("last_reviewed_at", "next_review_at"):
-                value = unit.get(date_field)
-                require(
-                    value is None or isinstance(value, str),
-                    f"{prefix}.{date_field} must be null or a string",
-                )
-
-            for evidence_path in evidence:
-                require(
-                    "\x00" not in evidence_path,
-                    f"{prefix}.evidence path must not contain NUL",
-                )
-                posix_path = PurePosixPath(evidence_path)
-                require(
-                    not posix_path.is_absolute(),
-                    f"{prefix}.evidence path must be relative: {evidence_path}",
-                )
-                require(
-                    len(posix_path.parts) >= 2
-                    and posix_path.parts[0] == "sessions"
-                    and ".." not in posix_path.parts
-                    and not evidence_path.endswith("/"),
-                    f"{prefix}.evidence path must name a file inside sessions/: "
-                    f"{evidence_path}",
-                )
-
-                if workspace_root is not None:
-                    sessions_boundary = workspace_root / "sessions"
-                    try:
-                        candidate = (
-                            workspace_root / Path(*posix_path.parts)
-                        ).resolve()
-                    except (ValueError, OSError, RuntimeError) as error:
-                        raise ValidationError(
-                            f"{prefix}.evidence path cannot be resolved: {evidence_path}"
-                        ) from error
-                    try:
-                        candidate.relative_to(sessions_boundary)
-                    except ValueError as error:
-                        raise ValidationError(
-                            f"{prefix}.evidence path is outside sessions/: {evidence_path}"
-                        ) from error
-                    require(
-                        candidate.is_file(),
-                        f"{prefix}.evidence file is missing: {evidence_path}",
-                    )
-
-    process = state.get("process")
-    require(isinstance(process, dict), "process must be an object")
-    for field in ("completed_plan_items", "recorded_sessions"):
-        value = process.get(field)
-        require(
-            isinstance(value, int) and not isinstance(value, bool) and value >= 0,
-            f"process.{field} must be a non-negative integer",
-        )
+def read_workspace_snapshot(workspace, require_consistent_state=True):
+    """Return an immutable snapshot read from one held workspace descriptor."""
+    root_fd = open_workspace_descriptor(workspace)
+    try:
+        return read_workspace_snapshot_fd(root_fd, require_consistent_state)
+    finally:
+        os.close(root_fd)
 
 
 def validate_workspace(workspace):
-    workspace = Path(workspace)
-    for relative_path in ("profile.md", "state.json", "plans/current.md"):
-        require(
-            (workspace / relative_path).is_file(),
-            f"required file is missing: {relative_path}",
-        )
-    for relative_path in ("mistakes", "sessions", "materials"):
-        require(
-            (workspace / relative_path).is_dir(),
-            f"required directory is missing: {relative_path}",
-        )
+    return read_workspace_snapshot(workspace, require_consistent_state=True)
 
-    try:
-        state = json.loads((workspace / "state.json").read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ValidationError(f"cannot read state.json: {error}") from error
 
-    validate_state(state, workspace)
-    return state
+def validate_workspace_fd(root_fd):
+    return read_workspace_snapshot_fd(root_fd, require_consistent_state=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workspace", type=Path)
     args = parser.parse_args()
-
     try:
         validate_workspace(args.workspace)
-    except ValidationError as error:
+    except (OSError, ValidationError) as error:
         print(f"INVALID: {error}", file=sys.stderr)
         return 1
-
     print(f"VALID: {args.workspace}")
     return 0
 

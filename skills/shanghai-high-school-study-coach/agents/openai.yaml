@@ -1,4 +1,4 @@
 interface:
   display_name: "上海高中学习教练"
-  short_description: "为上海高中生提供个性化讲解、练习、批改、复盘与学习规划"
-  default_prompt: "Use $shanghai-high-school-study-coach to analyze my current study needs and guide the next evidence-based step."
+  short_description: "根据学生真实作答识别六科薄弱点，并通过针对性练习持续强化"
+  default_prompt: "Use $shanghai-high-school-study-coach to diagnose my current weak points from my actual work, teach the missing part, and guide one targeted verification step."

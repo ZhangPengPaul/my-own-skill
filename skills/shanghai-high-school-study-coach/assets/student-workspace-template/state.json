@@ -1,17 +1,14 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "student_id": "__STUDENT_ID__",
   "updated_at": null,
   "subjects": {
-    "chinese": {"goal_type": "high-stakes", "assessments": [], "knowledge_units": {}},
-    "mathematics": {"goal_type": "high-stakes", "assessments": [], "knowledge_units": {}},
-    "english": {"goal_type": "high-stakes", "assessments": [], "knowledge_units": {}},
-    "politics": {"goal_type": "high-stakes", "assessments": [], "knowledge_units": {}},
-    "history": {"goal_type": "high-stakes", "assessments": [], "knowledge_units": {}},
-    "geography": {"goal_type": "high-stakes", "assessments": [], "knowledge_units": {}},
-    "physics": {"goal_type": "qualification", "assessments": [], "knowledge_units": {}, "qualification_risk": "unassessed"},
-    "chemistry": {"goal_type": "qualification", "assessments": [], "knowledge_units": {}, "qualification_risk": "unassessed"},
-    "biology": {"goal_type": "qualification", "assessments": [], "knowledge_units": {}, "qualification_risk": "unassessed"}
+    "chinese": {"knowledge_units": {}, "patterns": {}},
+    "mathematics": {"knowledge_units": {}, "patterns": {}},
+    "english": {"knowledge_units": {}, "patterns": {}},
+    "politics": {"knowledge_units": {}, "patterns": {}},
+    "history": {"knowledge_units": {}, "patterns": {}},
+    "geography": {"knowledge_units": {}, "patterns": {}}
   },
   "process": {"completed_plan_items": 0, "recorded_sessions": 0}
 }

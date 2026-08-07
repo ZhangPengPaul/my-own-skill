@@ -12,7 +12,11 @@ import stat
 import sys
 import tempfile
 
-from validate_student_data import STUDENT_ID, ValidationError, validate_workspace
+from validate_student_data import (
+    STUDENT_ID,
+    ValidationError,
+    validate_workspace_fd,
+)
 
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "assets/student-workspace-template"
@@ -45,10 +49,7 @@ def _load_templates():
     if not isinstance(state, dict):
         raise ValidationError("state template must contain a JSON object")
 
-    current_plan = _read_text_template(TEMPLATE / "plans/current.md")
-    for filename in ("session-record-template.md", "mistake-record-template.md"):
-        _read_text_template(TEMPLATE.parent / filename)
-    return profile, state, current_plan
+    return profile, state
 
 
 def _raise_publish_error(error_number, destination):
@@ -145,6 +146,38 @@ def _directory_open_flags():
         | os.O_NOFOLLOW
         | getattr(os, "O_CLOEXEC", 0)
     )
+
+
+def _mkdir_at(parent_fd, name):
+    os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+    child_fd = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+    opened = os.fstat(child_fd)
+    if not stat.S_ISDIR(opened.st_mode):
+        os.close(child_fd)
+        raise ValidationError("created child is not a directory: %s" % name)
+    return child_fd
+
+
+def _write_new_file(parent_fd, name, content, mode=0o600):
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    file_fd = os.open(name, flags, mode, dir_fd=parent_fd)
+    try:
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        offset = 0
+        while offset < len(data):
+            written = os.write(file_fd, data[offset:])
+            if written == 0:
+                raise OSError(errno.EIO, "write returned zero bytes")
+            offset += written
+        os.fsync(file_fd)
+    finally:
+        os.close(file_fd)
 
 
 def _same_identity(file_stat, identity, expected_type):
@@ -291,7 +324,7 @@ def initialize(root, student_id):
     root = root.resolve(strict=True)
     if not root.is_dir():
         raise ValidationError("workspace root must be a directory")
-    profile, state, current_plan = _load_templates()
+    profile, state = _load_templates()
 
     destination = root / student_id
     root_fd = None
@@ -321,20 +354,22 @@ def initialize(root, student_id):
             "before workspace construction",
         )
         identity = candidate_identity
-        (temporary / "plans").mkdir()
-        for directory in ("mistakes", "sessions", "materials"):
-            (temporary / directory).mkdir()
-        (temporary / "profile.md").write_text(
-            profile.replace(PROFILE_PLACEHOLDER, student_id), encoding="utf-8"
+        for directory in ("sessions", "plan-items", "summaries", "materials"):
+            child_fd = _mkdir_at(temporary_fd, directory)
+            os.close(child_fd)
+        _write_new_file(
+            temporary_fd,
+            "profile.md",
+            profile.replace(PROFILE_PLACEHOLDER, student_id),
         )
         state["student_id"] = student_id
         state["updated_at"] = datetime.now(timezone.utc).isoformat()
-        (temporary / "state.json").write_text(
-            json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        _write_new_file(
+            temporary_fd,
+            "state.json",
+            json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         )
-        (temporary / "plans/current.md").write_text(
-            current_plan, encoding="utf-8"
-        )
+        _write_new_file(temporary_fd, ".workspace.lock", b"")
 
         _require_named_identity(
             root_fd,
@@ -350,7 +385,7 @@ def initialize(root, student_id):
             identity,
             "before validation",
         )
-        validate_workspace(temporary)
+        validate_workspace_fd(temporary_fd)
         _require_named_identity(
             root_fd,
             temporary,

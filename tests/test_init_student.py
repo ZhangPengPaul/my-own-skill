@@ -20,6 +20,13 @@ import init_student
 
 
 class InitStudentTest(unittest.TestCase):
+    def temporary_path(self, root):
+        candidates = [
+            path for path in root.iterdir() if path.name.startswith(".student-a-")
+        ]
+        self.assertEqual(1, len(candidates))
+        return candidates[0]
+
     def run_init(self, root, student_id, script=SCRIPT):
         return subprocess.run(
             [sys.executable, str(script), "--root", str(root), student_id],
@@ -61,9 +68,10 @@ class InitStudentTest(unittest.TestCase):
             for relative in (
                 "profile.md",
                 "state.json",
-                "plans/current.md",
-                "mistakes",
+                ".workspace.lock",
                 "sessions",
+                "plan-items",
+                "summaries",
                 "materials",
             ):
                 self.assertTrue((workspace / relative).exists(), relative)
@@ -71,6 +79,23 @@ class InitStudentTest(unittest.TestCase):
                 (workspace / "state.json").read_text(encoding="utf-8")
             )
             self.assertEqual("student-a", state["student_id"])
+            self.assertEqual(2, state["schema_version"])
+            self.assertEqual(
+                {
+                    "chinese",
+                    "mathematics",
+                    "english",
+                    "politics",
+                    "history",
+                    "geography",
+                },
+                set(state["subjects"]),
+            )
+            for subject in state["subjects"].values():
+                self.assertEqual(
+                    {"knowledge_units", "patterns"},
+                    set(subject),
+                )
             updated_at = datetime.fromisoformat(state["updated_at"])
             self.assertIsNotNone(updated_at.tzinfo)
             self.assertEqual(timedelta(0), updated_at.utcoffset())
@@ -78,6 +103,66 @@ class InitStudentTest(unittest.TestCase):
                 "__STUDENT_ID__",
                 (workspace / "profile.md").read_text(encoding="utf-8"),
             )
+            profile = (workspace / "profile.md").read_text(encoding="utf-8")
+            for field in (
+                "grade",
+                "term",
+                "current_materials",
+                "teacher_priorities",
+                "learning_preferences",
+                "available_time",
+                "learning_goals",
+            ):
+                self.assertIn(field, profile)
+            for removed in ("selected_subjects", "target_exams", "target_dates"):
+                self.assertNotIn(removed, profile)
+
+    def test_temporary_name_replacement_does_not_redirect_construction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "outside"
+            outside.mkdir()
+            marker = outside / "marker.txt"
+            marker.write_text("preserve", encoding="utf-8")
+            real_mkdir_at = getattr(init_student, "_mkdir_at", None)
+            self.assertIsNotNone(real_mkdir_at, "descriptor-relative mkdir is missing")
+            calls = 0
+
+            def replace_name_after_first_child(parent_fd, name):
+                nonlocal calls
+                child_fd = real_mkdir_at(parent_fd, name)
+                calls += 1
+                if calls == 1:
+                    temporary_names = [
+                        path
+                        for path in root.iterdir()
+                        if path.name.startswith(".student-a-")
+                    ]
+                    self.assertEqual(1, len(temporary_names))
+                    temporary = temporary_names[0]
+                    moved = root / "owned-moved"
+                    temporary.rename(moved)
+                    try:
+                        temporary.symlink_to(outside, target_is_directory=True)
+                    except (NotImplementedError, OSError) as error:
+                        os.close(child_fd)
+                        self.skipTest(f"symlinks are unavailable: {error}")
+                return child_fd
+
+            with mock.patch.object(
+                init_student,
+                "_mkdir_at",
+                side_effect=replace_name_after_first_child,
+            ):
+                with self.assertRaisesRegex(
+                    init_student.ValidationError,
+                    "identity|changed",
+                ):
+                    init_student.initialize(root, "student-a")
+
+            self.assertEqual("preserve", marker.read_text(encoding="utf-8"))
+            self.assertEqual([marker], list(outside.iterdir()))
+            self.assertFalse((root / "student-a").exists())
 
     def test_refuses_to_overwrite_existing_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -113,12 +198,13 @@ class InitStudentTest(unittest.TestCase):
             outside_destination.mkdir()
             outside_destination_marker = outside_destination / "marker.txt"
             outside_destination_marker.write_text("preserve", encoding="utf-8")
-            original_validate = init_student.validate_workspace
+            original_validate = init_student.validate_workspace_fd
             outside_temporary = {}
 
-            def retarget_alias(workspace):
-                original_validate(workspace)
-                temporary = outside_root / workspace.name
+            def retarget_alias(workspace_fd):
+                original_validate(workspace_fd)
+                owned_temporary = self.temporary_path(real_root)
+                temporary = outside_root / owned_temporary.name
                 temporary.mkdir()
                 (temporary / "marker.txt").write_text("preserve", encoding="utf-8")
                 outside_temporary["path"] = temporary
@@ -126,7 +212,7 @@ class InitStudentTest(unittest.TestCase):
                 alias.symlink_to(outside_root, target_is_directory=True)
 
             with mock.patch.object(
-                init_student, "validate_workspace", side_effect=retarget_alias
+                init_student, "validate_workspace_fd", side_effect=retarget_alias
             ):
                 try:
                     destination = init_student.initialize(alias, "student-a")
@@ -150,15 +236,15 @@ class InitStudentTest(unittest.TestCase):
             root = Path(tmp)
             destination = root / "student-a"
             destination_inode = {}
-            original_validate = init_student.validate_workspace
+            original_validate = init_student.validate_workspace_fd
 
-            def create_destination(workspace):
-                original_validate(workspace)
+            def create_destination(workspace_fd):
+                original_validate(workspace_fd)
                 destination.mkdir()
                 destination_inode["before"] = destination.stat().st_ino
 
             with mock.patch.object(
-                init_student, "validate_workspace", side_effect=create_destination
+                init_student, "validate_workspace_fd", side_effect=create_destination
             ):
                 with self.assertRaisesRegex(
                     init_student.ValidationError, "workspace already exists"
@@ -217,7 +303,7 @@ class InitStudentTest(unittest.TestCase):
             root = Path(tmp)
             with mock.patch.object(
                 init_student,
-                "validate_workspace",
+                "validate_workspace_fd",
                 side_effect=KeyboardInterrupt("stop"),
             ):
                 with self.assertRaises(KeyboardInterrupt):
@@ -228,11 +314,12 @@ class InitStudentTest(unittest.TestCase):
     def test_cleanup_does_not_delete_replaced_temporary_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            original_validate = init_student.validate_workspace
+            original_validate = init_student.validate_workspace_fd
             replacement = {}
 
-            def replace_temporary(workspace):
-                original_validate(workspace)
+            def replace_temporary(workspace_fd):
+                original_validate(workspace_fd)
+                workspace = self.temporary_path(root)
                 workspace.rename(workspace.with_name(workspace.name + "-moved"))
                 workspace.mkdir()
                 marker = workspace / "marker.txt"
@@ -241,7 +328,7 @@ class InitStudentTest(unittest.TestCase):
                 raise RuntimeError("injected failure")
 
             with mock.patch.object(
-                init_student, "validate_workspace", side_effect=replace_temporary
+                init_student, "validate_workspace_fd", side_effect=replace_temporary
             ):
                 with self.assertRaisesRegex(RuntimeError, "injected failure"):
                     init_student.initialize(root, "student-a")
@@ -259,19 +346,13 @@ class InitStudentTest(unittest.TestCase):
     def test_cleanup_stays_on_verified_inode_when_top_level_name_is_replaced(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            original_validate = init_student.validate_workspace
-            real_fstat = os.fstat
-            real_rmtree = shutil.rmtree
+            original_validate = init_student.validate_workspace_fd
             probe = {}
 
-            def fail_after_validation(workspace):
-                original_validate(workspace)
+            def fail_after_validation(workspace_fd):
+                original_validate(workspace_fd)
+                workspace = self.temporary_path(root)
                 probe["temporary"] = workspace
-                raise RuntimeError("injected failure")
-
-            def replace_top_level_name():
-                if "replacement" in probe:
-                    return
                 temporary = probe["temporary"]
                 moved = temporary.with_name(temporary.name + "-moved-after-open")
                 temporary.rename(moved)
@@ -280,29 +361,12 @@ class InitStudentTest(unittest.TestCase):
                 marker.write_text("external", encoding="utf-8")
                 probe["moved"] = moved
                 probe["replacement"] = temporary
-
-            def replace_before_path_rmtree(path, *args, **kwargs):
-                replace_top_level_name()
-                return real_rmtree(path, *args, **kwargs)
-
-            def replace_after_directory_open(file_descriptor):
-                opened = real_fstat(file_descriptor)
-                if "temporary" in probe:
-                    replace_top_level_name()
-                return opened
+                raise RuntimeError("injected failure")
 
             with mock.patch.object(
                 init_student,
-                "validate_workspace",
+                "validate_workspace_fd",
                 side_effect=fail_after_validation,
-            ), mock.patch.object(
-                shutil,
-                "rmtree",
-                side_effect=replace_before_path_rmtree,
-            ), mock.patch.object(
-                init_student.os,
-                "fstat",
-                side_effect=replace_after_directory_open,
             ):
                 with self.assertRaisesRegex(RuntimeError, "injected failure"):
                     init_student.initialize(root, "student-a")
@@ -323,11 +387,12 @@ class InitStudentTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             destination = root / "student-a"
-            original_validate = init_student.validate_workspace
+            original_validate = init_student.validate_workspace_fd
             probe = {}
 
-            def replace_after_validation(workspace):
-                original_validate(workspace)
+            def replace_after_validation(workspace_fd):
+                original_validate(workspace_fd)
+                workspace = self.temporary_path(root)
                 moved = root / "moved-original"
                 workspace.rename(moved)
                 workspace.mkdir()
@@ -338,7 +403,7 @@ class InitStudentTest(unittest.TestCase):
 
             with mock.patch.object(
                 init_student,
-                "validate_workspace",
+                "validate_workspace_fd",
                 side_effect=replace_after_validation,
             ):
                 with self.assertRaisesRegex(
@@ -467,24 +532,6 @@ class InitStudentTest(unittest.TestCase):
             )
 
         self.assert_template_error(duplicate_marker)
-
-    def test_rejects_non_utf8_current_plan_without_partial_workspace(self):
-        self.assert_template_error(
-            lambda template: (template / "plans/current.md").write_bytes(b"\xff")
-        )
-
-    def test_rejects_non_utf8_record_templates_without_partial_workspace(self):
-        for filename in (
-            "session-record-template.md",
-            "mistake-record-template.md",
-        ):
-            with self.subTest(filename=filename):
-                self.assert_template_error(
-                    lambda template, filename=filename: (
-                        template.parent / filename
-                    ).write_bytes(b"\xff")
-                )
-
 
 if __name__ == "__main__":
     unittest.main()

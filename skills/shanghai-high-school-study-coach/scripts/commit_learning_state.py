@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Commit one immutable learning fact and reconcile derived state."""
+
+import argparse
+from datetime import datetime, timezone
+import errno
+import fcntl
+import json
+import os
+from pathlib import Path
+import sys
+import uuid
+
+from learning_state import ValidationError, reconcile_state, validate_fact
+from validate_student_data import (
+    _open_existing_directory,
+    _open_existing_regular,
+    open_workspace_descriptor,
+    read_workspace_snapshot_fd,
+    validate_state,
+)
+
+
+def _canonical_json(value):
+    return (
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def _write_all(file_fd, data):
+    offset = 0
+    while offset < len(data):
+        written = os.write(file_fd, data[offset:])
+        if written == 0:
+            raise OSError(errno.EIO, "write returned zero bytes")
+        offset += written
+
+
+def _read_all(file_fd):
+    chunks = []
+    while True:
+        chunk = os.read(file_fd, 65536)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _publish_fact_no_clobber(directory_fd, fact):
+    data = _canonical_json(fact)
+    filename = fact["record_id"] + ".json"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        file_fd = os.open(filename, flags, 0o600, dir_fd=directory_fd)
+    except FileExistsError:
+        existing_fd = _open_existing_regular(directory_fd, filename)
+        try:
+            existing = _read_all(existing_fd)
+        finally:
+            os.close(existing_fd)
+        if existing == data:
+            return False
+        raise ValidationError(
+            "record_id conflicts with an existing immutable fact: %s"
+            % fact["record_id"]
+        )
+
+    try:
+        _write_all(file_fd, data)
+        os.fsync(file_fd)
+    except BaseException:
+        try:
+            os.unlink(filename, dir_fd=directory_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(file_fd)
+    os.fsync(directory_fd)
+    return True
+
+
+def _replace_state_atomically(root_fd, state):
+    data = _canonical_json(state)
+    temporary_name = ".state-%s.tmp" % uuid.uuid4().hex
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    file_fd = None
+    try:
+        file_fd = os.open(temporary_name, flags, 0o600, dir_fd=root_fd)
+        _write_all(file_fd, data)
+        os.fsync(file_fd)
+        os.close(file_fd)
+        file_fd = None
+        os.replace(
+            temporary_name,
+            "state.json",
+            src_dir_fd=root_fd,
+            dst_dir_fd=root_fd,
+        )
+        os.fsync(root_fd)
+    except BaseException:
+        if file_fd is not None:
+            try:
+                os.close(file_fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(temporary_name, dir_fd=root_fd)
+        except OSError:
+            pass
+        raise
+
+
+def commit_fact(workspace, fact, now=None):
+    """Publish one immutable fact and reconcile state under one exclusive lock."""
+    validate_fact(fact)
+    root_fd = open_workspace_descriptor(workspace)
+    lock_fd = None
+    fact_directory_fd = None
+    try:
+        lock_fd = _open_existing_regular(root_fd, ".workspace.lock", writable=True)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        read_workspace_snapshot_fd(root_fd, require_consistent_state=False)
+        directory_name = (
+            "sessions" if fact["record_type"] == "session" else "plan-items"
+        )
+        fact_directory_fd = _open_existing_directory(root_fd, directory_name)
+        published = _publish_fact_no_clobber(fact_directory_fd, fact)
+
+        snapshot = read_workspace_snapshot_fd(
+            root_fd, require_consistent_state=False
+        )
+        candidate = reconcile_state(
+            snapshot.state["student_id"],
+            snapshot.sessions,
+            snapshot.plan_items,
+            previous_state=snapshot.state,
+            now=now or datetime.now(timezone.utc).isoformat(),
+        )
+        validate_state(candidate, snapshot.sessions, snapshot.plan_items)
+        if candidate != snapshot.state:
+            _replace_state_atomically(root_fd, candidate)
+        read_workspace_snapshot_fd(root_fd, require_consistent_state=True)
+        return published
+    finally:
+        if fact_directory_fd is not None:
+            os.close(fact_directory_fd)
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+        os.close(root_fd)
+
+
+def _read_fact_file(path):
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ValidationError("cannot read fact file: %s" % error) from error
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ValidationError("fact file is not valid JSON: %s" % error) from error
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("workspace", type=Path)
+    parser.add_argument("--fact-file", type=Path, required=True)
+    args = parser.parse_args()
+    try:
+        fact = _read_fact_file(args.fact_file)
+        published = commit_fact(args.workspace, fact)
+    except (OSError, ValidationError) as error:
+        print("ERROR: %s" % error, file=sys.stderr)
+        return 1
+    action = "COMMITTED" if published else "NO-OP"
+    print("%s: %s" % (action, fact["record_id"]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -73,6 +73,23 @@ class SkillContractTest(unittest.TestCase):
         content = OPENAI_YAML.read_text(encoding="utf-8")
         self.assertIn("$shanghai-high-school-study-coach", content)
 
+    def test_exam_policy_surface_is_absent(self):
+        package = SKILL.parent
+        paths = [SKILL, OPENAI_YAML, *sorted((package / "references").glob("*.md"))]
+        combined = "\n".join(path.read_text(encoding="utf-8") for path in paths)
+        for forbidden in (
+            "shanghai-curriculum-and-exams.md",
+            "上海市教育考试院",
+            "上海市教育委员会",
+            "https://edu.sh.gov.cn/",
+            "https://www.shmeea.edu.cn/",
+            "考试政策",
+            "评分口径",
+            "官方原文 URL",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, combined)
+
     def test_uses_portable_python_commands_from_skill_root(self):
         self.assertIn(
             "`<skill-root>` 表示当前 `SKILL.md` 所在目录",

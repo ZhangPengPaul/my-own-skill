@@ -119,6 +119,101 @@ class InitStudentTest(unittest.TestCase):
             for removed in ("selected_subjects", "target_exams", "target_dates"):
                 self.assertNotIn(removed, profile)
 
+    def test_file_close_error_does_not_mask_write_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory_fd = os.open(tmp, os.O_RDONLY)
+            created_fd = {}
+            close_attempts = []
+            real_open = os.open
+            real_close = os.close
+
+            def track_open(*args, **kwargs):
+                file_fd = real_open(*args, **kwargs)
+                created_fd["value"] = file_fd
+                return file_fd
+
+            def fail_write(file_fd, data):
+                raise OSError("fictional primary write failure")
+
+            def fail_created_close(file_fd):
+                if file_fd == created_fd.get("value"):
+                    close_attempts.append(file_fd)
+                    raise OSError("fictional file close failure")
+                return real_close(file_fd)
+
+            try:
+                with mock.patch.object(
+                    init_student.os,
+                    "open",
+                    side_effect=track_open,
+                ), mock.patch.object(
+                    init_student.os,
+                    "write",
+                    side_effect=fail_write,
+                ), mock.patch.object(
+                    init_student.os,
+                    "close",
+                    side_effect=fail_created_close,
+                ):
+                    with self.assertRaisesRegex(
+                        OSError,
+                        "primary write failure",
+                    ):
+                        init_student._write_new_file(
+                            directory_fd,
+                            "fictional.txt",
+                            "content",
+                        )
+                self.assertEqual([created_fd["value"]], close_attempts)
+            finally:
+                if "value" in created_fd:
+                    real_close(created_fd["value"])
+                real_close(directory_fd)
+
+    def test_file_close_failure_propagates_after_successful_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory_fd = os.open(tmp, os.O_RDONLY)
+            created_fd = {}
+            close_attempts = []
+            real_open = os.open
+            real_close = os.close
+
+            def track_open(*args, **kwargs):
+                file_fd = real_open(*args, **kwargs)
+                created_fd["value"] = file_fd
+                return file_fd
+
+            def fail_created_close(file_fd):
+                if file_fd == created_fd.get("value"):
+                    close_attempts.append(file_fd)
+                    raise OSError("fictional file close failure")
+                return real_close(file_fd)
+
+            try:
+                with mock.patch.object(
+                    init_student.os,
+                    "open",
+                    side_effect=track_open,
+                ), mock.patch.object(
+                    init_student.os,
+                    "close",
+                    side_effect=fail_created_close,
+                ):
+                    with self.assertRaisesRegex(
+                        OSError,
+                        "file close failure",
+                    ):
+                        init_student._write_new_file(
+                            directory_fd,
+                            "fictional.txt",
+                            "content",
+                        )
+                self.assertEqual([created_fd["value"]], close_attempts)
+            finally:
+                if "value" in created_fd:
+                    real_close(created_fd["value"])
+                real_close(directory_fd)
+
     def test_temporary_name_replacement_does_not_redirect_construction(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

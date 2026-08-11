@@ -172,6 +172,116 @@ class CommitLearningStateTest(unittest.TestCase):
             self.assertEqual(original_bytes, fact_path.read_bytes())
             self.assertEqual(state_bytes, (workspace / "state.json").read_bytes())
 
+    def test_existing_fact_close_error_does_not_mask_conflict(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        conflicting = session_fact(
+            student_attempt="fictional conflict",
+            observations=[knowledge_observation()],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            fact_directory = Path(tmp)
+            (fact_directory / (fact["record_id"] + ".json")).write_bytes(
+                commit_learning_state._canonical_json(fact)
+            )
+            directory_fd = os.open(fact_directory, os.O_RDONLY)
+            existing_fd = {}
+            close_attempts = []
+            real_open_existing = commit_learning_state._open_existing_regular
+            real_close = os.close
+
+            def track_existing(parent_fd, name, *args, **kwargs):
+                file_fd = real_open_existing(parent_fd, name, *args, **kwargs)
+                if name == fact["record_id"] + ".json":
+                    existing_fd["value"] = file_fd
+                return file_fd
+
+            def fail_existing_close(file_fd):
+                if file_fd == existing_fd.get("value"):
+                    close_attempts.append(file_fd)
+                    raise OSError("fictional existing fact close failure")
+                return real_close(file_fd)
+
+            try:
+                with mock.patch.object(
+                    commit_learning_state,
+                    "_publish_held_file_no_clobber",
+                    side_effect=FileExistsError,
+                ), mock.patch.object(
+                    commit_learning_state,
+                    "_open_existing_regular",
+                    side_effect=track_existing,
+                ), mock.patch.object(
+                    commit_learning_state.os,
+                    "close",
+                    side_effect=fail_existing_close,
+                ):
+                    with self.assertRaisesRegex(
+                        ValidationError,
+                        "record_id conflicts",
+                    ):
+                        commit_learning_state._publish_fact_no_clobber(
+                            directory_fd,
+                            conflicting,
+                        )
+                self.assertEqual([existing_fd["value"]], close_attempts)
+            finally:
+                if "value" in existing_fd:
+                    real_close(existing_fd["value"])
+                real_close(directory_fd)
+
+    def test_existing_fact_close_failure_propagates_after_successful_read(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        with tempfile.TemporaryDirectory() as tmp:
+            fact_directory = Path(tmp)
+            (fact_directory / (fact["record_id"] + ".json")).write_bytes(
+                commit_learning_state._canonical_json(fact)
+            )
+            directory_fd = os.open(fact_directory, os.O_RDONLY)
+            existing_fd = {}
+            close_attempts = []
+            real_open_existing = commit_learning_state._open_existing_regular
+            real_close = os.close
+
+            def track_existing(parent_fd, name, *args, **kwargs):
+                file_fd = real_open_existing(parent_fd, name, *args, **kwargs)
+                if name == fact["record_id"] + ".json":
+                    existing_fd["value"] = file_fd
+                return file_fd
+
+            def fail_existing_close(file_fd):
+                if file_fd == existing_fd.get("value"):
+                    close_attempts.append(file_fd)
+                    raise OSError("fictional existing fact close failure")
+                return real_close(file_fd)
+
+            try:
+                with mock.patch.object(
+                    commit_learning_state,
+                    "_publish_held_file_no_clobber",
+                    side_effect=FileExistsError,
+                ), mock.patch.object(
+                    commit_learning_state,
+                    "_open_existing_regular",
+                    side_effect=track_existing,
+                ), mock.patch.object(
+                    commit_learning_state.os,
+                    "close",
+                    side_effect=fail_existing_close,
+                ):
+                    with self.assertRaisesRegex(
+                        OSError,
+                        "existing fact close failure",
+                    ):
+                        commit_learning_state._publish_fact_no_clobber(
+                            directory_fd,
+                            fact,
+                        )
+                self.assertEqual([existing_fd["value"]], close_attempts)
+            finally:
+                if "value" in existing_fd:
+                    real_close(existing_fd["value"])
+                real_close(directory_fd)
+
     def test_interrupted_fact_write_never_exposes_final_name(self):
         fact = session_fact(observations=[knowledge_observation()])
         with tempfile.TemporaryDirectory() as tmp:

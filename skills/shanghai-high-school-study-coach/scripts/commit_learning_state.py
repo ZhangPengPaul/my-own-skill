@@ -177,6 +177,7 @@ def _publish_fact_no_clobber(directory_fd, fact):
             published = True
         except FileExistsError:
             existing_fd = _open_existing_regular(directory_fd, filename)
+            existing_body_failed = False
             try:
                 existing = _read_all(existing_fd)
                 if existing != data:
@@ -185,8 +186,15 @@ def _publish_fact_no_clobber(directory_fd, fact):
                         % fact["record_id"]
                     )
                 os.fsync(existing_fd)
+            except BaseException:
+                existing_body_failed = True
+                raise
             finally:
-                os.close(existing_fd)
+                try:
+                    os.close(existing_fd)
+                except BaseException:
+                    if not existing_body_failed:
+                        raise
             published = False
 
         if published:

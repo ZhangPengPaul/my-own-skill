@@ -129,10 +129,18 @@ def _read_fact_directory(directory_fd, label, validator, record_type):
     for name in names:
         require(name.endswith(".json"), f"invalid non-JSON entry in {label}: {name}")
         file_fd = _open_existing_regular(directory_fd, name)
+        body_failed = False
         try:
             fact = _read_json_fd(file_fd, f"{label}/{name}")
+        except BaseException:
+            body_failed = True
+            raise
         finally:
-            os.close(file_fd)
+            try:
+                os.close(file_fd)
+            except BaseException:
+                if not body_failed:
+                    raise
         require(
             isinstance(fact, dict),
             f"{label}/{name} must contain a JSON object",

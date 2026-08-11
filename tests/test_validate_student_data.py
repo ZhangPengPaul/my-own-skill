@@ -171,6 +171,100 @@ class ValidateStudentDataTest(unittest.TestCase):
                 ):
                     validate_workspace(workspace)
 
+    def test_fact_close_error_does_not_mask_read_failure(self):
+        session = session_fact(observations=[knowledge_observation()])
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace, sessions=[session])
+            fact_fd = {}
+            close_attempts = []
+            real_open_existing = validate_student_data._open_existing_regular
+            real_read_json = validate_student_data._read_json_fd
+            real_close = os.close
+
+            def track_fact(parent_fd, name, *args, **kwargs):
+                file_fd = real_open_existing(parent_fd, name, *args, **kwargs)
+                if name == session["record_id"] + ".json":
+                    fact_fd["value"] = file_fd
+                return file_fd
+
+            def fail_fact_read(file_fd, label):
+                if label.startswith("sessions/"):
+                    raise ValidationError("fictional primary fact read failure")
+                return real_read_json(file_fd, label)
+
+            def fail_fact_close(file_fd):
+                if file_fd == fact_fd.get("value"):
+                    close_attempts.append(file_fd)
+                    raise OSError("fictional fact close failure")
+                return real_close(file_fd)
+
+            try:
+                with mock.patch.object(
+                    validate_student_data,
+                    "_open_existing_regular",
+                    side_effect=track_fact,
+                ), mock.patch.object(
+                    validate_student_data,
+                    "_read_json_fd",
+                    side_effect=fail_fact_read,
+                ), mock.patch.object(
+                    validate_student_data.os,
+                    "close",
+                    side_effect=fail_fact_close,
+                ):
+                    with self.assertRaisesRegex(
+                        ValidationError,
+                        "primary fact read failure",
+                    ):
+                        validate_workspace(workspace)
+                self.assertEqual([fact_fd["value"]], close_attempts)
+            finally:
+                if "value" in fact_fd:
+                    real_close(fact_fd["value"])
+
+    def test_fact_close_failure_propagates_after_successful_read(self):
+        session = session_fact(observations=[knowledge_observation()])
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace, sessions=[session])
+            fact_fd = {}
+            close_attempts = []
+            real_open_existing = validate_student_data._open_existing_regular
+            real_close = os.close
+
+            def track_fact(parent_fd, name, *args, **kwargs):
+                file_fd = real_open_existing(parent_fd, name, *args, **kwargs)
+                if name == session["record_id"] + ".json":
+                    fact_fd["value"] = file_fd
+                return file_fd
+
+            def fail_fact_close(file_fd):
+                if file_fd == fact_fd.get("value"):
+                    close_attempts.append(file_fd)
+                    raise OSError("fictional fact close failure")
+                return real_close(file_fd)
+
+            try:
+                with mock.patch.object(
+                    validate_student_data,
+                    "_open_existing_regular",
+                    side_effect=track_fact,
+                ), mock.patch.object(
+                    validate_student_data.os,
+                    "close",
+                    side_effect=fail_fact_close,
+                ):
+                    with self.assertRaisesRegex(
+                        OSError,
+                        "fact close failure",
+                    ):
+                        validate_workspace(workspace)
+                self.assertEqual([fact_fd["value"]], close_attempts)
+            finally:
+                if "value" in fact_fd:
+                    real_close(fact_fd["value"])
+
     def test_rejects_symlinked_required_children_in_empty_workspace(self):
         for relative, is_directory in (
             ("profile.md", False),

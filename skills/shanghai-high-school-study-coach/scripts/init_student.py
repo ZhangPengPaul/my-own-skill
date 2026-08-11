@@ -170,6 +170,7 @@ def _write_new_file(parent_fd, name, content, mode=0o600):
         | getattr(os, "O_CLOEXEC", 0)
     )
     file_fd = os.open(name, flags, mode, dir_fd=parent_fd)
+    body_failed = False
     try:
         data = content.encode("utf-8") if isinstance(content, str) else content
         offset = 0
@@ -179,8 +180,15 @@ def _write_new_file(parent_fd, name, content, mode=0o600):
                 raise OSError(errno.EIO, "write returned zero bytes")
             offset += written
         os.fsync(file_fd)
+    except BaseException:
+        body_failed = True
+        raise
     finally:
-        os.close(file_fd)
+        try:
+            os.close(file_fd)
+        except BaseException:
+            if not body_failed:
+                raise
 
 
 def _same_identity(file_stat, identity, expected_type):

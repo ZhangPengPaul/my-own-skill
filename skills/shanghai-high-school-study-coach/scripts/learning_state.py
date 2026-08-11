@@ -447,6 +447,18 @@ def reconcile_state(
     now=None,
 ):
     _require_id(student_id, "student_id")
+    sessions = tuple(sessions)
+    plan_items = tuple(plan_items)
+    record_ids = set()
+    for record in sessions + plan_items:
+        require(isinstance(record, dict), "fact must be an object")
+        record_id = record.get("record_id")
+        _require_id(record_id, "record_id")
+        require(
+            record_id not in record_ids,
+            f"duplicate record_id: {record_id}",
+        )
+        record_ids.add(record_id)
     active_sessions = _active_revisions(
         sessions,
         "session_id",

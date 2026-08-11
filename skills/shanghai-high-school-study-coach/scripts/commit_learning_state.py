@@ -48,6 +48,10 @@ def _read_all(file_fd):
 def _publish_fact_no_clobber(directory_fd, fact):
     data = _canonical_json(fact)
     filename = fact["record_id"] + ".json"
+    temporary_name = ".%s-%s.tmp" % (
+        fact["record_id"],
+        uuid.uuid4().hex,
+    )
     flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -55,34 +59,63 @@ def _publish_fact_no_clobber(directory_fd, fact):
         | os.O_NOFOLLOW
         | getattr(os, "O_CLOEXEC", 0)
     )
+    file_fd = None
+    owns_temporary = False
     try:
-        file_fd = os.open(filename, flags, 0o600, dir_fd=directory_fd)
-    except FileExistsError:
-        existing_fd = _open_existing_regular(directory_fd, filename)
-        try:
-            existing = _read_all(existing_fd)
-        finally:
-            os.close(existing_fd)
-        if existing == data:
-            return False
-        raise ValidationError(
-            "record_id conflicts with an existing immutable fact: %s"
-            % fact["record_id"]
+        file_fd = os.open(
+            temporary_name,
+            flags,
+            0o600,
+            dir_fd=directory_fd,
         )
-
-    try:
+        owns_temporary = True
         _write_all(file_fd, data)
         os.fsync(file_fd)
-    except BaseException:
-        try:
-            os.unlink(filename, dir_fd=directory_fd)
-        except OSError:
-            pass
-        raise
-    finally:
         os.close(file_fd)
-    os.fsync(directory_fd)
-    return True
+        file_fd = None
+
+        try:
+            os.link(
+                temporary_name,
+                filename,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            published = True
+        except FileExistsError:
+            existing_fd = _open_existing_regular(directory_fd, filename)
+            try:
+                existing = _read_all(existing_fd)
+            finally:
+                os.close(existing_fd)
+            if existing != data:
+                raise ValidationError(
+                    "record_id conflicts with an existing immutable fact: %s"
+                    % fact["record_id"]
+                )
+            published = False
+
+        os.unlink(temporary_name, dir_fd=directory_fd)
+        owns_temporary = False
+        os.fsync(directory_fd)
+        return published
+    except BaseException:
+        if file_fd is not None:
+            try:
+                os.close(file_fd)
+            except OSError:
+                pass
+        if owns_temporary:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except OSError:
+                pass
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                pass
+        raise
 
 
 def _replace_state_atomically(root_fd, state):
@@ -131,10 +164,25 @@ def commit_fact(workspace, fact, now=None):
     try:
         lock_fd = _open_existing_regular(root_fd, ".workspace.lock", writable=True)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        read_workspace_snapshot_fd(root_fd, require_consistent_state=False)
+        snapshot = read_workspace_snapshot_fd(
+            root_fd,
+            require_consistent_state=False,
+        )
         directory_name = (
             "sessions" if fact["record_type"] == "session" else "plan-items"
         )
+        other_facts = (
+            snapshot.plan_items
+            if fact["record_type"] == "session"
+            else snapshot.sessions
+        )
+        if any(
+            existing["record_id"] == fact["record_id"]
+            for existing in other_facts
+        ):
+            raise ValidationError(
+                "duplicate record_id: %s" % fact["record_id"]
+            )
         fact_directory_fd = _open_existing_directory(root_fd, directory_name)
         published = _publish_fact_no_clobber(fact_directory_fd, fact)
 

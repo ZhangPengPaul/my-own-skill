@@ -206,6 +206,13 @@ class ReconciliationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "duplicate record_id"):
             reconcile_state("student-a", [first, second], [], now=NOW)
 
+    def test_cross_type_record_id_is_rejected(self):
+        session = session_fact()
+        plan = plan_fact(record_id=session["record_id"])
+
+        with self.assertRaisesRegex(ValidationError, "duplicate record_id"):
+            reconcile_state("student-a", [session], [plan], now=NOW)
+
     def test_revision_cycle_is_rejected(self):
         first = session_fact(
             record_id="record-first",

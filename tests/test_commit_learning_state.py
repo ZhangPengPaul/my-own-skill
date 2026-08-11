@@ -133,6 +133,69 @@ class CommitLearningStateTest(unittest.TestCase):
             self.assertEqual(original_bytes, fact_path.read_bytes())
             self.assertEqual(state_bytes, (workspace / "state.json").read_bytes())
 
+    def test_interrupted_fact_write_never_exposes_final_name(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            fact_directory = workspace / "sessions"
+            final_path = fact_directory / "record-session-001.json"
+            temporary_names = []
+
+            def interrupt_fact_write(file_fd, data):
+                self.assertFalse(final_path.exists())
+                names = [path.name for path in fact_directory.iterdir()]
+                self.assertEqual(1, len(names))
+                self.assertRegex(
+                    names[0],
+                    r"^\.record-session-001-[0-9a-f]{32}\.tmp$",
+                )
+                temporary_names.extend(names)
+                raise OSError("fictional interrupted fact write")
+
+            with mock.patch.object(
+                commit_learning_state,
+                "_write_all",
+                side_effect=interrupt_fact_write,
+            ):
+                with self.assertRaisesRegex(OSError, "interrupted fact write"):
+                    commit_fact(workspace, fact, now=NOW)
+
+            self.assertFalse(final_path.exists())
+            self.assertTrue(temporary_names)
+            self.assertEqual(
+                [],
+                [
+                    name
+                    for name in temporary_names
+                    if (fact_directory / name).exists()
+                ],
+            )
+
+    def test_cross_type_record_id_conflict_preserves_workspace(self):
+        session = session_fact(observations=[knowledge_observation()])
+        plan = plan_fact(record_id=session["record_id"])
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            commit_fact(workspace, session, now=NOW)
+            plan_directory = workspace / "plan-items"
+            plan_before = {
+                path.name: path.read_bytes() for path in plan_directory.iterdir()
+            }
+            state_before = (workspace / "state.json").read_bytes()
+
+            with self.assertRaisesRegex(ValidationError, "duplicate record_id"):
+                commit_fact(workspace, plan, now=LATER)
+
+            self.assertEqual(
+                plan_before,
+                {path.name: path.read_bytes() for path in plan_directory.iterdir()},
+            )
+            self.assertEqual(
+                state_before,
+                (workspace / "state.json").read_bytes(),
+            )
+            validate_workspace(workspace)
+
     def test_state_replace_failure_is_recoverable(self):
         fact = session_fact(observations=[knowledge_observation()])
         with tempfile.TemporaryDirectory() as tmp:

@@ -8,6 +8,7 @@ SCRIPTS = ROOT / "skills/shanghai-high-school-study-coach/scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from learning_state import (  # noqa: E402
+    SUBJECT_MODULES,
     ValidationError,
     reconcile_state,
     validate_fact,
@@ -23,11 +24,89 @@ from tests.workspace_fixtures import (  # noqa: E402
 
 
 NOW = "2026-08-06T12:00:00+00:00"
+EXPECTED_SUBJECT_MODULES = {
+    "chinese": {
+        "language-and-accumulation",
+        "classical-texts",
+        "modern-reading",
+        "writing",
+        "integrated-expression",
+    },
+    "mathematics": {
+        "sets-and-logic",
+        "algebra-and-functions",
+        "geometry",
+        "probability-and-statistics",
+        "modeling-and-applications",
+    },
+    "english": {
+        "vocabulary-and-grammar",
+        "reading",
+        "translation",
+        "writing",
+        "integrated-language-use",
+    },
+    "politics": {
+        "concepts-and-principles",
+        "material-analysis",
+        "reasoning-and-argument",
+        "answer-organization",
+    },
+    "history": {
+        "chronology-and-facts",
+        "source-analysis",
+        "causation-and-change",
+        "comparison-and-evaluation",
+        "historical-expression",
+    },
+    "geography": {
+        "maps-and-space",
+        "data-and-charts",
+        "processes-and-mechanisms",
+        "regional-analysis",
+        "human-environment",
+    },
+}
 
 
 class FactSchemaTest(unittest.TestCase):
+    def test_runtime_subject_modules_match_reference_contract(self):
+        self.assertEqual(EXPECTED_SUBJECT_MODULES, SUBJECT_MODULES)
+
     def test_completed_session_may_record_direct_explanation_without_evidence(self):
         validate_session_fact(session_fact(student_attempt=None, observations=[]))
+
+    def test_zulu_timestamps_are_accepted_by_all_consumers(self):
+        session = session_fact(
+            completed_at="2026-08-06T10:00:00Z",
+            observations=[
+                knowledge_observation(
+                    next_review_at="2026-08-13T10:00:00Z"
+                )
+            ],
+        )
+
+        validate_session_fact(session)
+        validate_plan_fact(plan_fact(due_at="2026-08-13T10:00:00Z"))
+        reconcile_state("student-a", [session], [], now="2026-08-06T12:00:00Z")
+
+    def test_timestamps_reject_date_only_and_naive_values(self):
+        for value in ("2026-08-06", "2026-08-06T10:00:00"):
+            with self.subTest(field="completed_at", value=value):
+                with self.assertRaisesRegex(ValidationError, "completed_at"):
+                    validate_session_fact(session_fact(completed_at=value))
+            with self.subTest(field="next_review_at", value=value):
+                fact = session_fact(
+                    observations=[knowledge_observation(next_review_at=value)]
+                )
+                with self.assertRaisesRegex(ValidationError, "next_review_at"):
+                    validate_session_fact(fact)
+            with self.subTest(field="due_at", value=value):
+                with self.assertRaisesRegex(ValidationError, "due_at"):
+                    validate_plan_fact(plan_fact(due_at=value))
+            with self.subTest(field="now", value=value):
+                with self.assertRaisesRegex(ValidationError, "now"):
+                    reconcile_state("student-a", [], [], now=value)
 
     def test_session_requires_valid_task_id(self):
         for task_id in ("", "../task"):
@@ -240,6 +319,54 @@ class FactSchemaTest(unittest.TestCase):
 
 
 class ReconciliationTest(unittest.TestCase):
+    def test_equal_instants_use_session_identity_tie_breakers(self):
+        local = session_fact(
+            record_id="record-local",
+            session_id="session-001",
+            completed_at="2026-08-06T10:00:00+08:00",
+            observations=[knowledge_observation(evidence_id="evidence-local")],
+        )
+        utc = session_fact(
+            record_id="record-utc",
+            session_id="session-002",
+            completed_at="2026-08-06T02:00:00+00:00",
+            observations=[knowledge_observation(evidence_id="evidence-utc")],
+        )
+
+        state = reconcile_state("student-a", [utc, local], [], now=NOW)
+
+        unit = state["subjects"]["mathematics"]["knowledge_units"][
+            "mathematics.geometry.dihedral-angle"
+        ]
+        self.assertEqual(
+            ["evidence-local", "evidence-utc"],
+            unit["evidence_ids"],
+        )
+
+    def test_completed_sessions_sort_by_absolute_instant(self):
+        earlier = session_fact(
+            record_id="record-earlier",
+            session_id="session-002",
+            completed_at="2026-08-06T10:00:00+08:00",
+            observations=[knowledge_observation(evidence_id="evidence-earlier")],
+        )
+        later = session_fact(
+            record_id="record-later",
+            session_id="session-001",
+            completed_at="2026-08-06T03:00:00+00:00",
+            observations=[knowledge_observation(evidence_id="evidence-later")],
+        )
+
+        state = reconcile_state("student-a", [later, earlier], [], now=NOW)
+
+        unit = state["subjects"]["mathematics"]["knowledge_units"][
+            "mathematics.geometry.dihedral-angle"
+        ]
+        self.assertEqual(
+            ["evidence-earlier", "evidence-later"],
+            unit["evidence_ids"],
+        )
+
     def test_single_initial_error_is_only_suspected(self):
         fact = session_fact(
             observations=[

@@ -122,16 +122,29 @@ def _require_id(value, field):
     require(isinstance(value, str) and ID.fullmatch(value), f"{field} is invalid")
 
 
-def _require_timestamp(value, field, allow_none=False):
+def _parse_timestamp(value, field, allow_none=False):
     if allow_none and value is None:
-        return
+        return None
     require(isinstance(value, str) and value.strip(), f"{field} is required")
+    message = f"{field} must be an ISO-8601 timestamp with a timezone"
+    require(
+        len(value) > 10 and value[10] in ("T", " "),
+        message,
+    )
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
     try:
-        datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(normalized)
     except ValueError as error:
-        raise ValidationError(
-            f"{field} must be an ISO-8601 timestamp"
-        ) from error
+        raise ValidationError(message) from error
+    require(
+        parsed.tzinfo is not None and parsed.utcoffset() is not None,
+        message,
+    )
+    return parsed
+
+
+def _require_timestamp(value, field, allow_none=False):
+    _parse_timestamp(value, field, allow_none=allow_none)
 
 
 def _require_optional_string(value, field):
@@ -655,7 +668,7 @@ def reconcile_state(
             if fact["status"] == "completed"
         ),
         key=lambda fact: (
-            fact["completed_at"],
+            _parse_timestamp(fact["completed_at"], "completed_at"),
             fact["session_id"],
             fact["record_id"],
         ),

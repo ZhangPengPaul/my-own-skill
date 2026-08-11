@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -242,6 +243,17 @@ class ValidateStudentDataTest(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "UTF-8"):
                 validate_workspace(workspace)
 
+    def test_cli_rejects_non_object_fact_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace)
+            (workspace / "sessions/record-session-001.json").write_text(
+                "[]\n",
+                encoding="utf-8",
+            )
+
+            self.assert_cli_invalid(workspace)
+
     def test_rejects_plan_record_in_sessions_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp) / "student-a"
@@ -346,6 +358,293 @@ class ValidateStudentDataTest(unittest.TestCase):
                     )
 
                 self.assert_cli_invalid(workspace)
+
+    def test_snapshot_cleanup_attempts_every_close_after_one_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace)
+            opened = []
+            target_fd = {}
+            close_attempts = []
+            real_open_regular = validate_student_data._open_existing_regular
+            real_open_directory = validate_student_data._open_existing_directory
+            real_close = os.close
+
+            def track_regular(parent_fd, name, *args, **kwargs):
+                file_fd = real_open_regular(parent_fd, name, *args, **kwargs)
+                opened.append(file_fd)
+                if name == "profile.md":
+                    target_fd["value"] = file_fd
+                return file_fd
+
+            def track_directory(parent_fd, name):
+                directory_fd = real_open_directory(parent_fd, name)
+                opened.append(directory_fd)
+                return directory_fd
+
+            def fail_profile_close(file_fd):
+                close_attempts.append(file_fd)
+                if file_fd == target_fd.get("value"):
+                    raise OSError("fictional profile close failure")
+                return real_close(file_fd)
+
+            try:
+                with mock.patch.object(
+                    validate_student_data,
+                    "_open_existing_regular",
+                    side_effect=track_regular,
+                ), mock.patch.object(
+                    validate_student_data,
+                    "_open_existing_directory",
+                    side_effect=track_directory,
+                ), mock.patch.object(
+                    validate_student_data.os,
+                    "close",
+                    side_effect=fail_profile_close,
+                ):
+                    with self.assertRaisesRegex(OSError, "profile close failure"):
+                        validate_workspace(workspace)
+
+                self.assertTrue(opened)
+                self.assertEqual(set(opened), set(close_attempts) & set(opened))
+            finally:
+                for file_fd in opened:
+                    try:
+                        real_close(file_fd)
+                    except OSError:
+                        pass
+
+    def test_snapshot_cleanup_errors_do_not_mask_primary_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace)
+            snapshot_fds = []
+            close_attempts = []
+            lock_open_count = 0
+            real_open_regular = validate_student_data._open_existing_regular
+            real_open_directory = validate_student_data._open_existing_directory
+            real_close = os.close
+
+            def track_regular(parent_fd, name, *args, **kwargs):
+                nonlocal lock_open_count
+                file_fd = real_open_regular(parent_fd, name, *args, **kwargs)
+                if name == ".workspace.lock":
+                    lock_open_count += 1
+                    if lock_open_count > 1:
+                        snapshot_fds.append(file_fd)
+                else:
+                    snapshot_fds.append(file_fd)
+                return file_fd
+
+            def track_directory(parent_fd, name):
+                directory_fd = real_open_directory(parent_fd, name)
+                snapshot_fds.append(directory_fd)
+                return directory_fd
+
+            def fail_snapshot_closes(file_fd):
+                close_attempts.append(file_fd)
+                if file_fd in snapshot_fds:
+                    raise OSError("fictional snapshot cleanup failure")
+                return real_close(file_fd)
+
+            try:
+                with mock.patch.object(
+                    validate_student_data,
+                    "_open_existing_regular",
+                    side_effect=track_regular,
+                ), mock.patch.object(
+                    validate_student_data,
+                    "_open_existing_directory",
+                    side_effect=track_directory,
+                ), mock.patch.object(
+                    validate_student_data,
+                    "_read_utf8",
+                    side_effect=ValidationError("fictional primary read failure"),
+                ), mock.patch.object(
+                    validate_student_data.os,
+                    "close",
+                    side_effect=fail_snapshot_closes,
+                ):
+                    with self.assertRaisesRegex(
+                        ValidationError,
+                        "primary read failure",
+                    ):
+                        validate_workspace(workspace)
+
+                self.assertEqual(
+                    set(snapshot_fds),
+                    set(close_attempts) & set(snapshot_fds),
+                )
+            finally:
+                for file_fd in snapshot_fds:
+                    try:
+                        real_close(file_fd)
+                    except OSError:
+                        pass
+
+    def test_outer_cleanup_errors_do_not_mask_primary_snapshot_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace)
+            descriptors = {}
+            close_attempts = []
+            unlock_attempts = []
+            real_open_workspace = validate_student_data.open_workspace_descriptor
+            real_open_regular = validate_student_data._open_existing_regular
+            real_close = os.close
+            real_flock = validate_student_data.fcntl.flock
+
+            def track_workspace(path):
+                file_fd = real_open_workspace(path)
+                descriptors["root"] = file_fd
+                return file_fd
+
+            def track_lock(parent_fd, name, *args, **kwargs):
+                file_fd = real_open_regular(parent_fd, name, *args, **kwargs)
+                descriptors["lock"] = file_fd
+                return file_fd
+
+            def fail_outer_closes(file_fd):
+                close_attempts.append(file_fd)
+                if file_fd in descriptors.values():
+                    raise OSError("fictional outer close failure")
+                return real_close(file_fd)
+
+            def fail_unlock(file_fd, operation):
+                if operation == validate_student_data.fcntl.LOCK_UN:
+                    unlock_attempts.append(file_fd)
+                    raise OSError("fictional unlock failure")
+                return real_flock(file_fd, operation)
+
+            try:
+                with mock.patch.object(
+                    validate_student_data,
+                    "open_workspace_descriptor",
+                    side_effect=track_workspace,
+                ), mock.patch.object(
+                    validate_student_data,
+                    "_open_existing_regular",
+                    side_effect=track_lock,
+                ), mock.patch.object(
+                    validate_student_data,
+                    "_read_workspace_snapshot_fd_unlocked",
+                    side_effect=ValidationError(
+                        "fictional primary snapshot failure"
+                    ),
+                ), mock.patch.object(
+                    validate_student_data.os,
+                    "close",
+                    side_effect=fail_outer_closes,
+                ), mock.patch.object(
+                    validate_student_data.fcntl,
+                    "flock",
+                    side_effect=fail_unlock,
+                ):
+                    with self.assertRaisesRegex(
+                        ValidationError,
+                        "primary snapshot failure",
+                    ):
+                        validate_workspace(workspace)
+
+                self.assertIn(descriptors["lock"], unlock_attempts)
+                self.assertIn(descriptors["lock"], close_attempts)
+                self.assertIn(descriptors["root"], close_attempts)
+            finally:
+                lock_fd = descriptors.get("lock")
+                if lock_fd is not None:
+                    try:
+                        real_flock(lock_fd, validate_student_data.fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                for file_fd in set(descriptors.values()):
+                    try:
+                        real_close(file_fd)
+                    except OSError:
+                        pass
+
+    def test_snapshot_cleanup_error_escapes_callers_outer_exception_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace)
+            real_close_all = validate_student_data._close_all
+
+            def close_all_then_fail(file_descriptors):
+                real_close_all(file_descriptors)
+                raise OSError("fictional snapshot cleanup failure")
+
+            with mock.patch.object(
+                validate_student_data,
+                "_close_all",
+                side_effect=close_all_then_fail,
+            ):
+                try:
+                    raise ValueError("fictional caller exception")
+                except ValueError:
+                    with self.assertRaisesRegex(
+                        OSError,
+                        "snapshot cleanup failure",
+                    ):
+                        validate_workspace(workspace)
+
+    def test_lock_cleanup_error_escapes_callers_outer_exception_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace)
+            real_cleanup = validate_student_data._cleanup_lock_descriptor
+
+            def cleanup_then_fail(lock_fd):
+                real_cleanup(lock_fd)
+                raise OSError("fictional lock cleanup failure")
+
+            with mock.patch.object(
+                validate_student_data,
+                "_cleanup_lock_descriptor",
+                side_effect=cleanup_then_fail,
+            ):
+                try:
+                    raise ValueError("fictional caller exception")
+                except ValueError:
+                    with self.assertRaisesRegex(
+                        OSError,
+                        "lock cleanup failure",
+                    ):
+                        validate_workspace(workspace)
+
+    def test_root_cleanup_error_escapes_callers_outer_exception_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace)
+            root_descriptor = {}
+            real_open_workspace = validate_student_data.open_workspace_descriptor
+            real_close = os.close
+
+            def track_workspace(path):
+                root_fd = real_open_workspace(path)
+                root_descriptor["value"] = root_fd
+                return root_fd
+
+            def close_root_then_fail(file_fd):
+                real_close(file_fd)
+                if file_fd == root_descriptor.get("value"):
+                    raise OSError("fictional root cleanup failure")
+
+            with mock.patch.object(
+                validate_student_data,
+                "open_workspace_descriptor",
+                side_effect=track_workspace,
+            ), mock.patch.object(
+                validate_student_data.os,
+                "close",
+                side_effect=close_root_then_fail,
+            ):
+                try:
+                    raise ValueError("fictional caller exception")
+                except ValueError:
+                    with self.assertRaisesRegex(
+                        OSError,
+                        "root cleanup failure",
+                    ):
+                        validate_workspace(workspace)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,10 @@
 from datetime import datetime, timedelta
 from pathlib import Path
+import errno
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -310,6 +312,248 @@ class InitStudentTest(unittest.TestCase):
                     init_student.initialize(root, "student-a")
 
             self.assertEqual([], list(root.iterdir()))
+
+    def test_workspace_publish_fsyncs_temporary_before_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            temporary = root / "temporary"
+            destination = root / "student-a"
+            temporary.mkdir()
+            root_fd = os.open(root, init_student._directory_open_flags())
+            temporary_fd = os.open(
+                temporary,
+                init_student._directory_open_flags(),
+            )
+            opened = os.fstat(temporary_fd)
+            identity = (opened.st_dev, opened.st_ino)
+            events = []
+            real_fsync = os.fsync
+            real_publish = init_student._publish_no_replace
+
+            def track_fsync(file_fd):
+                if file_fd == temporary_fd:
+                    events.append("fsync-temporary")
+                elif file_fd == root_fd:
+                    events.append("fsync-root")
+                return real_fsync(file_fd)
+
+            def track_publish(source, target):
+                events.append("publish")
+                return real_publish(source, target)
+
+            try:
+                with mock.patch.object(
+                    init_student.os,
+                    "fsync",
+                    side_effect=track_fsync,
+                ), mock.patch.object(
+                    init_student,
+                    "_publish_no_replace",
+                    side_effect=track_publish,
+                ):
+                    init_student._publish_verified_workspace(
+                        root_fd,
+                        temporary,
+                        destination,
+                        temporary_fd,
+                        identity,
+                    )
+            finally:
+                os.close(temporary_fd)
+                os.close(root_fd)
+
+            self.assertEqual(
+                ["fsync-temporary", "publish", "fsync-root"],
+                events,
+            )
+
+    def test_directory_fsync_failures_leave_no_partial_workspace(self):
+        for stage in ("temporary", "root"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                root_identity = (root.stat().st_dev, root.stat().st_ino)
+                real_fsync = os.fsync
+                failed = False
+
+                def fail_selected_directory_fsync(file_fd):
+                    nonlocal failed
+                    entry = os.fstat(file_fd)
+                    if not stat.S_ISDIR(entry.st_mode):
+                        return real_fsync(file_fd)
+                    identity = (entry.st_dev, entry.st_ino)
+                    selected = (
+                        identity != root_identity
+                        if stage == "temporary"
+                        else identity == root_identity
+                    )
+                    if selected and not failed:
+                        failed = True
+                        raise OSError("fictional %s fsync failure" % stage)
+                    return real_fsync(file_fd)
+
+                with mock.patch.object(
+                    init_student.os,
+                    "fsync",
+                    side_effect=fail_selected_directory_fsync,
+                ):
+                    with self.assertRaisesRegex(OSError, "%s fsync" % stage):
+                        init_student.initialize(root, "student-a")
+
+                self.assertTrue(failed)
+                self.assertEqual([], list(root.iterdir()))
+
+    def test_mkdtemp_open_recovers_by_releasing_reserved_descriptor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_open = os.open
+            real_close = os.close
+            real_dup = os.dup
+            failed_calls = 0
+            reserve = {"fd": None, "released": False}
+
+            def track_reserve(file_fd):
+                reserve["fd"] = real_dup(file_fd)
+                return reserve["fd"]
+
+            def track_reserve_release(file_fd):
+                if file_fd == reserve["fd"]:
+                    reserve["released"] = True
+                return real_close(file_fd)
+
+            def fail_temporary_open(path, *args, **kwargs):
+                nonlocal failed_calls
+                if (
+                    isinstance(path, str)
+                    and path.startswith(".student-a-")
+                    and not reserve["released"]
+                ):
+                    failed_calls += 1
+                    raise OSError(
+                        errno.EMFILE,
+                        "fictional persistent temporary open failure",
+                    )
+                return real_open(path, *args, **kwargs)
+
+            with mock.patch.object(
+                init_student.os,
+                "open",
+                side_effect=fail_temporary_open,
+            ), mock.patch.object(
+                init_student.os,
+                "dup",
+                side_effect=track_reserve,
+            ), mock.patch.object(
+                init_student.os,
+                "close",
+                side_effect=track_reserve_release,
+            ):
+                destination = init_student.initialize(root, "student-a")
+
+            self.assertEqual(1, failed_calls)
+            self.assertTrue(reserve["released"])
+            self.assertEqual(root.resolve() / "student-a", destination)
+            self.assertEqual(
+                ["student-a"],
+                [path.name for path in root.iterdir()],
+            )
+
+    def test_failed_recovery_open_never_deletes_replacement_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_open = os.open
+            real_close = os.close
+            real_dup = os.dup
+            reserve = {"fd": None, "released": False}
+            attempts = 0
+            paths = {}
+
+            def track_reserve(file_fd):
+                reserve["fd"] = real_dup(file_fd)
+                return reserve["fd"]
+
+            def track_reserve_release(file_fd):
+                if file_fd == reserve["fd"]:
+                    reserve["released"] = True
+                return real_close(file_fd)
+
+            def fail_and_replace_temporary(path, *args, **kwargs):
+                nonlocal attempts
+                if isinstance(path, str) and path.startswith(".student-a-"):
+                    attempts += 1
+                    if attempts == 2:
+                        temporary = root / path
+                        moved = root / "owned-moved-after-emfile"
+                        temporary.rename(moved)
+                        temporary.mkdir()
+                        marker = temporary / "foreign-marker.txt"
+                        marker.write_text("preserve", encoding="utf-8")
+                        paths["moved"] = moved
+                        paths["replacement"] = temporary
+                    raise OSError(errno.EMFILE, "fictional persistent EMFILE")
+                return real_open(path, *args, **kwargs)
+
+            with mock.patch.object(
+                init_student.os,
+                "open",
+                side_effect=fail_and_replace_temporary,
+            ), mock.patch.object(
+                init_student.os,
+                "dup",
+                side_effect=track_reserve,
+            ), mock.patch.object(
+                init_student.os,
+                "close",
+                side_effect=track_reserve_release,
+            ):
+                with self.assertRaisesRegex(OSError, "persistent EMFILE"):
+                    init_student.initialize(root, "student-a")
+
+            self.assertEqual(2, attempts)
+            self.assertTrue(reserve["released"])
+            self.assertEqual(
+                "preserve",
+                (paths["replacement"] / "foreign-marker.txt").read_text(
+                    encoding="utf-8"
+                ),
+            )
+            self.assertTrue(paths["moved"].is_dir())
+            self.assertFalse((root / "student-a").exists())
+
+    def test_mkdir_fstat_failure_closes_child_descriptor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root_fd = os.open(tmp, init_student._directory_open_flags())
+            child_fd = None
+            real_open = os.open
+            real_close = os.close
+
+            def track_child_open(path, *args, **kwargs):
+                nonlocal child_fd
+                child_fd = real_open(path, *args, **kwargs)
+                return child_fd
+
+            try:
+                with mock.patch.object(
+                    init_student.os,
+                    "open",
+                    side_effect=track_child_open,
+                ), mock.patch.object(
+                    init_student.os,
+                    "fstat",
+                    side_effect=OSError("fictional child fstat failure"),
+                ):
+                    with self.assertRaisesRegex(OSError, "child fstat failure"):
+                        init_student._mkdir_at(root_fd, "child")
+
+                self.assertIsNotNone(child_fd)
+                with self.assertRaises(OSError):
+                    os.fstat(child_fd)
+            finally:
+                if child_fd is not None:
+                    try:
+                        real_close(child_fd)
+                    except OSError:
+                        pass
+                real_close(root_fd)
 
     def test_cleanup_does_not_delete_replaced_temporary_directory(self):
         with tempfile.TemporaryDirectory() as tmp:

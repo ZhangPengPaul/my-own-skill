@@ -160,8 +160,9 @@ def _publish_fact_no_clobber(directory_fd, fact):
             or _entry_identity(written_entry) != temporary_identity
         ):
             raise ValidationError("temporary fact identity changed while writing")
-        os.close(file_fd)
+        closing_fd = file_fd
         file_fd = None
+        os.close(closing_fd)
 
         source_fd = _open_existing_regular(directory_fd, temporary_name)
         if _entry_identity(os.fstat(source_fd)) != temporary_identity:
@@ -198,14 +199,16 @@ def _publish_fact_no_clobber(directory_fd, fact):
                 )
             os.fsync(published_fd)
 
-        os.close(source_fd)
+        closing_fd = source_fd
         source_fd = None
+        os.close(closing_fd)
         if published:
             os.fsync(directory_fd)
             if _name_identity(directory_fd, filename) != published_identity:
                 raise ValidationError("published fact identity changed")
-            os.close(published_fd)
+            closing_fd = published_fd
             published_fd = None
+            os.close(closing_fd)
         if not _unlink_if_identity_matches(
             directory_fd,
             temporary_name,
@@ -217,18 +220,24 @@ def _publish_fact_no_clobber(directory_fd, fact):
         return published
     except BaseException:
         if file_fd is not None:
+            closing_fd = file_fd
+            file_fd = None
             try:
-                os.close(file_fd)
+                os.close(closing_fd)
             except OSError:
                 pass
         if source_fd is not None:
+            closing_fd = source_fd
+            source_fd = None
             try:
-                os.close(source_fd)
+                os.close(closing_fd)
             except OSError:
                 pass
         if published_fd is not None:
+            closing_fd = published_fd
+            published_fd = None
             try:
-                os.close(published_fd)
+                os.close(closing_fd)
             except OSError:
                 pass
         if owns_temporary:
@@ -263,8 +272,9 @@ def _replace_state_atomically(root_fd, state):
         file_fd = os.open(temporary_name, flags, 0o600, dir_fd=root_fd)
         _write_all(file_fd, data)
         os.fsync(file_fd)
-        os.close(file_fd)
+        closing_fd = file_fd
         file_fd = None
+        os.close(closing_fd)
         os.replace(
             temporary_name,
             "state.json",
@@ -274,8 +284,10 @@ def _replace_state_atomically(root_fd, state):
         os.fsync(root_fd)
     except BaseException:
         if file_fd is not None:
+            closing_fd = file_fd
+            file_fd = None
             try:
-                os.close(file_fd)
+                os.close(closing_fd)
             except OSError:
                 pass
         try:
@@ -285,12 +297,35 @@ def _replace_state_atomically(root_fd, state):
         raise
 
 
+def _cleanup_commit_descriptors(fact_directory_fd, lock_fd, root_fd):
+    first_error = None
+
+    def attempt(operation):
+        nonlocal first_error
+        try:
+            operation()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+
+    if fact_directory_fd is not None:
+        attempt(lambda: os.close(fact_directory_fd))
+    if lock_fd is not None:
+        attempt(lambda: fcntl.flock(lock_fd, fcntl.LOCK_UN))
+        attempt(lambda: os.close(lock_fd))
+    if root_fd is not None:
+        attempt(lambda: os.close(root_fd))
+    if first_error is not None:
+        raise first_error
+
+
 def commit_fact(workspace, fact, now=None):
     """Publish one immutable fact and reconcile state under one exclusive lock."""
     validate_fact(fact)
     root_fd = open_workspace_descriptor(workspace)
     lock_fd = None
     fact_directory_fd = None
+    body_failed = False
     try:
         lock_fd = _open_existing_regular(root_fd, ".workspace.lock", writable=True)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -363,15 +398,25 @@ def commit_fact(workspace, fact, now=None):
             require_consistent_state=True,
         )
         return published
+    except BaseException:
+        body_failed = True
+        raise
     finally:
-        if fact_directory_fd is not None:
-            os.close(fact_directory_fd)
-        if lock_fd is not None:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            finally:
-                os.close(lock_fd)
-        os.close(root_fd)
+        closing_fact_directory_fd = fact_directory_fd
+        fact_directory_fd = None
+        closing_lock_fd = lock_fd
+        lock_fd = None
+        closing_root_fd = root_fd
+        root_fd = None
+        try:
+            _cleanup_commit_descriptors(
+                closing_fact_directory_fd,
+                closing_lock_fd,
+                closing_root_fd,
+            )
+        except BaseException:
+            if not body_failed:
+                raise
 
 
 def _read_fact_file(path):

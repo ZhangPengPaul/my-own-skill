@@ -134,6 +134,10 @@ def _read_fact_directory(directory_fd, label, validator, record_type):
         finally:
             os.close(file_fd)
         require(
+            isinstance(fact, dict),
+            f"{label}/{name} must contain a JSON object",
+        )
+        require(
             fact.get("record_type") == record_type,
             f"record_type is invalid for {label}/{name}",
         )
@@ -144,6 +148,33 @@ def _read_fact_directory(directory_fd, label, validator, record_type):
         )
         facts.append(fact)
     return tuple(facts)
+
+
+def _close_all(file_descriptors):
+    first_error = None
+    for file_fd in file_descriptors:
+        try:
+            os.close(file_fd)
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        raise first_error
+
+
+def _cleanup_lock_descriptor(lock_fd):
+    first_error = None
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    except BaseException as error:
+        first_error = error
+    try:
+        os.close(lock_fd)
+    except BaseException as error:
+        if first_error is None:
+            first_error = error
+    if first_error is not None:
+        raise first_error
 
 
 def _first_state_mismatch(state, candidate):
@@ -204,6 +235,7 @@ def _read_workspace_snapshot_fd_unlocked(root_fd, require_consistent_state=True)
     """Read required children while the caller holds the workspace lock."""
     opened_files = []
     opened_directories = []
+    body_failed = False
     try:
         for name in REQUIRED_REGULAR_FILES:
             opened_files.append((name, _open_existing_regular(root_fd, name)))
@@ -214,6 +246,7 @@ def _read_workspace_snapshot_fd_unlocked(root_fd, require_consistent_state=True)
         directory_descriptors = dict(opened_directories)
         _read_utf8(file_descriptors["profile.md"], "profile.md")
         state = _read_json_fd(file_descriptors["state.json"], "state.json")
+        require(isinstance(state, dict), "state must be an object")
         sessions = _read_fact_directory(
             directory_descriptors["sessions"],
             "sessions",
@@ -229,36 +262,56 @@ def _read_workspace_snapshot_fd_unlocked(root_fd, require_consistent_state=True)
         if require_consistent_state:
             validate_state(state, sessions, plan_items)
         return WorkspaceSnapshot(state, sessions, plan_items)
+    except BaseException:
+        body_failed = True
+        raise
     finally:
-        for _, file_fd in opened_files:
-            os.close(file_fd)
-        for _, directory_fd in opened_directories:
-            os.close(directory_fd)
+        try:
+            _close_all(
+                [file_fd for _, file_fd in opened_files]
+                + [directory_fd for _, directory_fd in opened_directories]
+            )
+        except BaseException:
+            if not body_failed:
+                raise
 
 
 def read_workspace_snapshot_fd(root_fd, require_consistent_state=True):
     """Read one snapshot while holding the workspace's shared lock."""
     lock_fd = _open_existing_regular(root_fd, ".workspace.lock")
+    body_failed = False
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_SH)
-        try:
-            return _read_workspace_snapshot_fd_unlocked(
-                root_fd,
-                require_consistent_state,
-            )
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        return _read_workspace_snapshot_fd_unlocked(
+            root_fd,
+            require_consistent_state,
+        )
+    except BaseException:
+        body_failed = True
+        raise
     finally:
-        os.close(lock_fd)
+        try:
+            _cleanup_lock_descriptor(lock_fd)
+        except BaseException:
+            if not body_failed:
+                raise
 
 
 def read_workspace_snapshot(workspace, require_consistent_state=True):
     """Return an immutable snapshot read from one held workspace descriptor."""
     root_fd = open_workspace_descriptor(workspace)
+    body_failed = False
     try:
         return read_workspace_snapshot_fd(root_fd, require_consistent_state)
+    except BaseException:
+        body_failed = True
+        raise
     finally:
-        os.close(root_fd)
+        try:
+            os.close(root_fd)
+        except BaseException:
+            if not body_failed:
+                raise
 
 
 def validate_workspace(workspace):

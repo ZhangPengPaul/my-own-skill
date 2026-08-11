@@ -151,11 +151,14 @@ def _directory_open_flags():
 def _mkdir_at(parent_fd, name):
     os.mkdir(name, mode=0o700, dir_fd=parent_fd)
     child_fd = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
-    opened = os.fstat(child_fd)
-    if not stat.S_ISDIR(opened.st_mode):
-        os.close(child_fd)
-        raise ValidationError("created child is not a directory: %s" % name)
-    return child_fd
+    try:
+        opened = os.fstat(child_fd)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise ValidationError("created child is not a directory: %s" % name)
+        return child_fd
+    except BaseException:
+        _close_no_raise(child_fd)
+        raise
 
 
 def _write_new_file(parent_fd, name, content, mode=0o600):
@@ -271,6 +274,7 @@ def _publish_verified_workspace(
         identity,
         "before publication",
     )
+    os.fsync(temporary_fd)
     _publish_no_replace(temporary, destination)
     try:
         _require_named_identity(
@@ -283,6 +287,7 @@ def _publish_verified_workspace(
     except ValidationError as identity_error:
         try:
             _publish_no_replace(destination, temporary)
+            os.fsync(root_fd)
         except BaseException as rollback_error:
             raise ValidationError(
                 "published workspace identity mismatch; manual inspection required: %s"
@@ -291,6 +296,7 @@ def _publish_verified_workspace(
         raise ValidationError(
             "temporary workspace identity changed during publication"
         ) from identity_error
+    os.fsync(root_fd)
 
 
 def _cleanup_owned_temporary(
@@ -312,6 +318,7 @@ def _cleanup_owned_temporary(
                     os.rmdir(name, dir_fd=root_fd)
                 except OSError:
                     continue
+        os.fsync(root_fd)
     except BaseException:
         return
 
@@ -328,6 +335,7 @@ def initialize(root, student_id):
 
     destination = root / student_id
     root_fd = None
+    reserve_fd = None
     temporary = None
     temporary_fd = None
     identity = None
@@ -336,24 +344,46 @@ def initialize(root, student_id):
         root_fd = os.open(os.fspath(root), flags)
         if destination.exists():
             raise ValidationError("workspace already exists: %s" % destination)
+        reserve_fd = os.dup(root_fd)
 
         temporary = Path(
             tempfile.mkdtemp(prefix=".%s-" % student_id, dir=str(root))
         )
-        temporary_fd = os.open(temporary.name, flags, dir_fd=root_fd)
-        created = os.fstat(temporary_fd)
-        if not stat.S_ISDIR(created.st_mode):
+        named = os.stat(
+            temporary.name,
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(named.st_mode):
             raise ValidationError("temporary workspace is not a directory")
-        candidate_identity = (created.st_dev, created.st_ino)
+        identity = (named.st_dev, named.st_ino)
+        try:
+            temporary_fd = os.open(temporary.name, flags, dir_fd=root_fd)
+        except OSError as error:
+            if (
+                error.errno not in (errno.EMFILE, errno.ENFILE)
+                or reserve_fd is None
+            ):
+                raise
+            closing_fd = reserve_fd
+            reserve_fd = None
+            _close_no_raise(closing_fd)
+            temporary_fd = os.open(temporary.name, flags, dir_fd=root_fd)
+        if reserve_fd is not None:
+            closing_fd = reserve_fd
+            reserve_fd = None
+            _close_no_raise(closing_fd)
+        created = os.fstat(temporary_fd)
+        if not _same_identity(created, identity, stat.S_ISDIR):
+            raise ValidationError("temporary workspace identity changed after open")
 
         _require_named_identity(
             root_fd,
             temporary,
             temporary_fd,
-            candidate_identity,
+            identity,
             "before workspace construction",
         )
-        identity = candidate_identity
         for directory in ("sessions", "plan-items", "summaries", "materials"):
             child_fd = _mkdir_at(temporary_fd, directory)
             os.close(child_fd)
@@ -406,6 +436,7 @@ def initialize(root, student_id):
             )
         raise
     finally:
+        _close_no_raise(reserve_fd)
         _close_no_raise(temporary_fd)
         _close_no_raise(root_fd)
     return destination

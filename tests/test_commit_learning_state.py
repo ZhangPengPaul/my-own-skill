@@ -462,6 +462,62 @@ class CommitLearningStateTest(unittest.TestCase):
             self.assertTrue(replacement_path.exists())
             self.assertEqual(replacement, replacement_path.read_bytes())
 
+    def test_close_error_does_not_close_reused_descriptor(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        operations = (
+            (
+                "fact publication",
+                lambda directory_fd: commit_learning_state._publish_fact_no_clobber(
+                    directory_fd,
+                    fact,
+                ),
+            ),
+            (
+                "state replacement",
+                lambda directory_fd: commit_learning_state._replace_state_atomically(
+                    directory_fd,
+                    {"fictional": "state"},
+                ),
+            ),
+        )
+        for label, operation in operations:
+            with self.subTest(operation=label), tempfile.TemporaryDirectory() as tmp:
+                directory_fd = os.open(tmp, os.O_RDONLY | os.O_DIRECTORY)
+                replacement_fd = None
+                released_fd = None
+                real_close = os.close
+
+                def close_then_report_error(file_fd):
+                    nonlocal replacement_fd, released_fd
+                    if released_fd is None:
+                        released_fd = file_fd
+                        real_close(file_fd)
+                        replacement_fd = os.open(os.devnull, os.O_RDONLY)
+                        raise OSError("fictional ambiguous close failure")
+                    return real_close(file_fd)
+
+                try:
+                    with mock.patch.object(
+                        commit_learning_state.os,
+                        "close",
+                        side_effect=close_then_report_error,
+                    ):
+                        with self.assertRaisesRegex(
+                            OSError,
+                            "ambiguous close failure",
+                        ):
+                            operation(directory_fd)
+
+                    self.assertEqual(released_fd, replacement_fd)
+                    os.fstat(replacement_fd)
+                finally:
+                    if replacement_fd is not None:
+                        try:
+                            real_close(replacement_fd)
+                        except OSError:
+                            pass
+                    real_close(directory_fd)
+
     def test_publish_fails_closed_without_held_fd_primitive(self):
         fact = session_fact(observations=[knowledge_observation()])
         with tempfile.TemporaryDirectory() as tmp:
@@ -817,6 +873,199 @@ class CommitLearningStateTest(unittest.TestCase):
                 {path.name for path in (workspace / "sessions").iterdir()},
             )
 
+    def test_fact_directory_close_failure_does_not_skip_other_cleanup(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            descriptors = {}
+            unlocks = []
+            close_attempts = []
+            failed_fact_close = False
+            real_open_workspace = commit_learning_state.open_workspace_descriptor
+            real_open_regular = commit_learning_state._open_existing_regular
+            real_open_directory = commit_learning_state._open_existing_directory
+            real_close = os.close
+            real_flock = commit_learning_state.fcntl.flock
+
+            def track_workspace(path):
+                file_fd = real_open_workspace(path)
+                descriptors["root"] = file_fd
+                return file_fd
+
+            def track_regular(parent_fd, name, *args, **kwargs):
+                file_fd = real_open_regular(parent_fd, name, *args, **kwargs)
+                if name == ".workspace.lock" and "lock" not in descriptors:
+                    descriptors["lock"] = file_fd
+                return file_fd
+
+            def track_directory(parent_fd, name):
+                directory_fd = real_open_directory(parent_fd, name)
+                descriptors["fact"] = directory_fd
+                return directory_fd
+
+            def close_with_fact_failure(file_fd):
+                nonlocal failed_fact_close
+                close_attempts.append(file_fd)
+                if file_fd == descriptors.get("fact") and not failed_fact_close:
+                    failed_fact_close = True
+                    raise OSError("fictional fact directory close failure")
+                return real_close(file_fd)
+
+            def track_flock(file_fd, operation):
+                if operation == commit_learning_state.fcntl.LOCK_UN:
+                    unlocks.append(file_fd)
+                return real_flock(file_fd, operation)
+
+            try:
+                with mock.patch.object(
+                    commit_learning_state,
+                    "open_workspace_descriptor",
+                    side_effect=track_workspace,
+                ), mock.patch.object(
+                    commit_learning_state,
+                    "_open_existing_regular",
+                    side_effect=track_regular,
+                ), mock.patch.object(
+                    commit_learning_state,
+                    "_open_existing_directory",
+                    side_effect=track_directory,
+                ), mock.patch.object(
+                    commit_learning_state.os,
+                    "close",
+                    side_effect=close_with_fact_failure,
+                ), mock.patch.object(
+                    commit_learning_state.fcntl,
+                    "flock",
+                    side_effect=track_flock,
+                ):
+                    with self.assertRaisesRegex(OSError, "fact directory close"):
+                        commit_fact(workspace, fact, now=NOW)
+
+                self.assertTrue(failed_fact_close)
+                self.assertIn(descriptors["lock"], unlocks)
+                self.assertIn(descriptors["lock"], close_attempts)
+                self.assertIn(descriptors["root"], close_attempts)
+                for name in ("lock", "root"):
+                    with self.assertRaises(OSError):
+                        os.fstat(descriptors[name])
+            finally:
+                lock_fd = descriptors.get("lock")
+                if lock_fd is not None:
+                    try:
+                        real_flock(lock_fd, commit_learning_state.fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                for file_fd in set(descriptors.values()):
+                    try:
+                        real_close(file_fd)
+                    except OSError:
+                        pass
+
+    def test_cleanup_errors_do_not_mask_primary_commit_error(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            descriptors = {}
+            close_attempts = []
+            real_open_workspace = commit_learning_state.open_workspace_descriptor
+            real_open_regular = commit_learning_state._open_existing_regular
+            real_open_directory = commit_learning_state._open_existing_directory
+            real_close = os.close
+            real_flock = commit_learning_state.fcntl.flock
+
+            def track_workspace(path):
+                file_fd = real_open_workspace(path)
+                descriptors["root"] = file_fd
+                return file_fd
+
+            def track_regular(parent_fd, name, *args, **kwargs):
+                file_fd = real_open_regular(parent_fd, name, *args, **kwargs)
+                if name == ".workspace.lock" and "lock" not in descriptors:
+                    descriptors["lock"] = file_fd
+                return file_fd
+
+            def track_directory(parent_fd, name):
+                directory_fd = real_open_directory(parent_fd, name)
+                descriptors["fact"] = directory_fd
+                return directory_fd
+
+            def fail_multiple_closes(file_fd):
+                close_attempts.append(file_fd)
+                if file_fd in (
+                    descriptors.get("fact"),
+                    descriptors.get("lock"),
+                ):
+                    raise OSError("fictional commit cleanup failure")
+                return real_close(file_fd)
+
+            try:
+                with mock.patch.object(
+                    commit_learning_state,
+                    "open_workspace_descriptor",
+                    side_effect=track_workspace,
+                ), mock.patch.object(
+                    commit_learning_state,
+                    "_open_existing_regular",
+                    side_effect=track_regular,
+                ), mock.patch.object(
+                    commit_learning_state,
+                    "_open_existing_directory",
+                    side_effect=track_directory,
+                ), mock.patch.object(
+                    commit_learning_state,
+                    "_publish_fact_no_clobber",
+                    side_effect=ValidationError("fictional primary publish failure"),
+                ), mock.patch.object(
+                    commit_learning_state.os,
+                    "close",
+                    side_effect=fail_multiple_closes,
+                ):
+                    with self.assertRaisesRegex(
+                        ValidationError,
+                        "primary publish failure",
+                    ):
+                        commit_fact(workspace, fact, now=NOW)
+
+                self.assertIn(descriptors["fact"], close_attempts)
+                self.assertIn(descriptors["lock"], close_attempts)
+                self.assertIn(descriptors["root"], close_attempts)
+            finally:
+                lock_fd = descriptors.get("lock")
+                if lock_fd is not None:
+                    try:
+                        real_flock(lock_fd, commit_learning_state.fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                for file_fd in set(descriptors.values()):
+                    try:
+                        real_close(file_fd)
+                    except OSError:
+                        pass
+
+    def test_cleanup_error_escapes_callers_outer_exception_context(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            real_cleanup = commit_learning_state._cleanup_commit_descriptors
+
+            def cleanup_then_fail(*file_descriptors):
+                real_cleanup(*file_descriptors)
+                raise OSError("fictional commit cleanup failure")
+
+            with mock.patch.object(
+                commit_learning_state,
+                "_cleanup_commit_descriptors",
+                side_effect=cleanup_then_fail,
+            ):
+                try:
+                    raise ValueError("fictional caller exception")
+                except ValueError:
+                    with self.assertRaisesRegex(
+                        OSError,
+                        "commit cleanup failure",
+                    ):
+                        commit_fact(workspace, fact, now=NOW)
+
     def test_cli_rejects_invalid_fact_without_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = self.initialize_workspace(Path(tmp))
@@ -825,6 +1074,21 @@ class CommitLearningStateTest(unittest.TestCase):
             self.assertEqual(1, result.returncode)
             self.assertTrue(result.stderr.startswith("ERROR:"), result.stderr)
             self.assertNotIn("Traceback", result.stderr)
+
+    def test_cli_rejects_non_object_state_without_traceback(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            (workspace / "state.json").write_text("[]\n", encoding="utf-8")
+
+            result = self.run_cli(workspace, fact)
+
+            self.assertEqual(1, result.returncode)
+            self.assertTrue(result.stderr.startswith("ERROR:"), result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertFalse(
+                (workspace / "sessions/record-session-001.json").exists()
+            )
 
 
 if __name__ == "__main__":

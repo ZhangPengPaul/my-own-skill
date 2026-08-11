@@ -121,6 +121,18 @@ class SummarizeProgressTest(unittest.TestCase):
         self.assertIn("强化中: 1", output)
         self.assertIn("到期复测", output)
         self.assertIn("重复出现", output)
+        self.assertIn(
+            "待确认目标 [suspected_gap；到期复测; evidence: evidence-001]",
+            output,
+        )
+        self.assertIn(
+            "已确认目标 [confirmed_gap; evidence: evidence-002, evidence-006]",
+            output,
+        )
+        self.assertIn(
+            "模式：方法选择 [重复出现; evidence: evidence-004, evidence-005]",
+            output,
+        )
         self.assertIn("优先级 1", output)
         self.assertIn("已完成计划项目: 0", output)
         self.assertIn("记录会话: 5", output)
@@ -151,6 +163,80 @@ class SummarizeProgressTest(unittest.TestCase):
 
         self.assertLess(output.index("第一项"), output.index("第二项"))
         self.assertLess(output.index("第二项"), output.index("第三项"))
+
+    def test_plan_due_dates_are_sorted_by_absolute_aware_instant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            for record_id, item_id, due_at, task in (
+                (
+                    "record-plan-001",
+                    "item-001",
+                    "2026-08-08T00:30:00+01:00",
+                    "绝对时间较早",
+                ),
+                (
+                    "record-plan-002",
+                    "item-002",
+                    "2026-08-07T23:45:00Z",
+                    "绝对时间较晚",
+                ),
+                ("record-plan-003", "item-003", None, "未设日期"),
+            ):
+                commit_fact(
+                    workspace,
+                    plan_fact(
+                        record_id=record_id,
+                        item_id=item_id,
+                        priority=1,
+                        due_at=due_at,
+                        task=task,
+                    ),
+                    now=NOW,
+                )
+
+            output = summarize_progress.render(workspace, now=NOW)
+
+        self.assertLess(output.index("绝对时间较早"), output.index("绝对时间较晚"))
+        self.assertLess(output.index("绝对时间较晚"), output.index("未设日期"))
+
+    def test_uses_shared_timestamp_parser_for_now_reviews_and_plan_due_dates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            self.commit_session(
+                workspace,
+                1,
+                [
+                    knowledge_observation(
+                        evidence_type="initial_attempt",
+                        next_review_at="2026-08-06T12:00:00Z",
+                    )
+                ],
+            )
+            commit_fact(
+                workspace,
+                plan_fact(due_at="2026-08-08T00:30:00+01:00"),
+                now=NOW,
+            )
+            shared_parser = summarize_progress._parse_timestamp
+
+            with mock.patch.object(
+                summarize_progress,
+                "_parse_timestamp",
+                wraps=shared_parser,
+            ) as parser:
+                summarize_progress.render(
+                    workspace,
+                    now="2026-08-06T13:00:00+01:00",
+                )
+
+        self.assertEqual(
+            [
+                mock.call("2026-08-06T13:00:00+01:00", "now"),
+                mock.call("2026-08-06T12:00:00Z", "next_review_at"),
+                mock.call("2026-08-08T00:30:00+01:00", "due_at"),
+            ],
+            parser.call_args_list,
+        )
 
     def test_renders_the_snapshot_returned_by_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -191,6 +277,37 @@ class SummarizeProgressTest(unittest.TestCase):
 
         self.assertNotIn("\n# injected heading", output)
         self.assertIn("安全名称\\u000A# injected heading", output)
+
+    def test_escapes_control_characters_in_snapshot_evidence_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            self.commit_session(
+                workspace,
+                1,
+                [knowledge_observation(evidence_type="initial_attempt")],
+            )
+            original_validate_workspace = summarize_progress.validate_workspace
+
+            def validate_with_hostile_evidence(workspace_to_validate):
+                snapshot = original_validate_workspace(workspace_to_validate)
+                target = snapshot.state["subjects"]["mathematics"][
+                    "knowledge_units"
+                ]["mathematics.geometry.dihedral-angle"]
+                target["evidence_ids"] = ["evidence-safe", "evidence-hostile\n# heading"]
+                return snapshot
+
+            with mock.patch.object(
+                summarize_progress,
+                "validate_workspace",
+                side_effect=validate_with_hostile_evidence,
+            ):
+                output = summarize_progress.render(workspace, now=NOW)
+
+        self.assertNotIn("\n# heading", output)
+        self.assertIn(
+            "evidence: evidence-safe, evidence-hostile\\u000A# heading",
+            output,
+        )
 
     def test_uses_six_subjects_in_canonical_order(self):
         expected = [

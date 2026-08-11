@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sys
 
-from learning_state import SUBJECTS
+from learning_state import SUBJECTS, _parse_timestamp
 from validate_student_data import ValidationError, validate_workspace
 
 
@@ -37,15 +37,6 @@ def _escape_markdown_line(value):
     return "".join(escaped)
 
 
-def _parse_timestamp(value):
-    if value.endswith("Z"):
-        value = value[:-1] + "+00:00"
-    parsed = datetime.fromisoformat(value)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
-
-
 def _active_pending_plan_items(plan_items):
     superseded = {
         item["supersedes_record_id"]
@@ -62,7 +53,9 @@ def _active_pending_plan_items(plan_items):
         key=lambda item: (
             item["priority"],
             item["due_at"] is None,
-            item["due_at"] or "",
+            _parse_timestamp(item["due_at"], "due_at")
+            if item["due_at"] is not None
+            else None,
             item["item_id"],
         ),
     )
@@ -83,14 +76,19 @@ def _render_subject(lines, subject_name, subject, now):
     for target_id, target in sorted(units.items()):
         due = target["next_review_at"]
         due_label = ""
-        if due is not None and _parse_timestamp(due) <= now:
+        if due is not None and _parse_timestamp(due, "next_review_at") <= now:
             due_label = "；到期复测"
+        evidence_ids = ", ".join(
+            _escape_markdown_line(evidence_id)
+            for evidence_id in target["evidence_ids"]
+        )
         lines.append(
-            "- %s [%s%s]"
+            "- %s [%s%s; evidence: %s]"
             % (
                 _escape_markdown_line(target["name"]),
                 _escape_markdown_line(target["status"]),
                 due_label,
+                evidence_ids,
             )
         )
 
@@ -100,11 +98,16 @@ def _render_subject(lines, subject_name, subject, now):
         if target["status"] in PATTERN_LABELS
     ]
     for target_id, target in sorted(patterns):
+        evidence_ids = ", ".join(
+            _escape_markdown_line(evidence_id)
+            for evidence_id in target["evidence_ids"]
+        )
         lines.append(
-            "- 模式：%s [%s]"
+            "- 模式：%s [%s; evidence: %s]"
             % (
                 _escape_markdown_line(target["name"]),
-                PATTERN_LABELS[target["status"]],
+                _escape_markdown_line(PATTERN_LABELS[target["status"]]),
+                evidence_ids,
             )
         )
     lines.append("")
@@ -114,7 +117,10 @@ def render(workspace, now=None):
     workspace = Path(workspace)
     snapshot = validate_workspace(workspace)
     state = snapshot.state
-    current = _parse_timestamp(now or datetime.now(timezone.utc).isoformat())
+    current = _parse_timestamp(
+        now or datetime.now(timezone.utc).isoformat(),
+        "now",
+    )
     lines = [
         "# 学习进度摘要",
         "",

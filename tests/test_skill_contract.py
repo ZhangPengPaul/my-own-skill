@@ -153,6 +153,31 @@ class SkillContractTest(unittest.TestCase):
         ):
             self.assertIn(phrase, section)
 
+    def test_priority_protocol_matches_confirmed_spec(self):
+        section = extract_section(self.content, "优先级和学习计划")
+        for phrase in (
+            "教师明确要求",
+            "学生当前目标",
+            "覆盖自动排序",
+            "前置依赖影响",
+            "证据强度",
+            "重复出现频率",
+            "当前教材与教师进度",
+            "到期复测",
+            "可用时间",
+            "1 个主要内容薄弱",
+            "1 个必要前置内容",
+            "1 个重复出现的执行模式",
+            "以及到期复测",
+        ):
+            self.assertIn(phrase, section)
+        self.assertLess(section.index("教师明确要求"), section.index("自动排序"))
+        self.assertLess(section.index("学生当前目标"), section.index("自动排序"))
+        self.assertIn(
+            "匹配学科、目标类型和目标ID的真实证据",
+            re.sub(r"\s+", "", section),
+        )
+
     def test_portable_commands_are_documented(self):
         self.assertIn(
             "`<skill-root>` 表示当前 `SKILL.md` 所在目录",

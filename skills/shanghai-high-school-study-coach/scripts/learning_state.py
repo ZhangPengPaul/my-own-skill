@@ -12,6 +12,61 @@ SUBJECTS = (
     "history",
     "geography",
 )
+SUBJECT_MODULES = {
+    "chinese": frozenset(
+        {
+            "language-and-accumulation",
+            "classical-texts",
+            "modern-reading",
+            "writing",
+            "integrated-expression",
+        }
+    ),
+    "mathematics": frozenset(
+        {
+            "sets-and-logic",
+            "algebra-and-functions",
+            "geometry",
+            "probability-and-statistics",
+            "modeling-and-applications",
+        }
+    ),
+    "english": frozenset(
+        {
+            "vocabulary-and-grammar",
+            "reading",
+            "translation",
+            "writing",
+            "integrated-language-use",
+        }
+    ),
+    "politics": frozenset(
+        {
+            "concepts-and-principles",
+            "material-analysis",
+            "reasoning-and-argument",
+            "answer-organization",
+        }
+    ),
+    "history": frozenset(
+        {
+            "chronology-and-facts",
+            "source-analysis",
+            "causation-and-change",
+            "comparison-and-evaluation",
+            "historical-expression",
+        }
+    ),
+    "geography": frozenset(
+        {
+            "maps-and-space",
+            "data-and-charts",
+            "processes-and-mechanisms",
+            "regional-analysis",
+            "human-environment",
+        }
+    ),
+}
 TASK_MODES = (
     "assessment",
     "explanation",
@@ -79,10 +134,46 @@ def _require_timestamp(value, field, allow_none=False):
         ) from error
 
 
+def _require_optional_string(value, field):
+    require(
+        value is None or (isinstance(value, str) and value.strip()),
+        f"{field} must be null or a nonempty string",
+    )
+
+
 def _require_exact_keys(value, expected, label):
     require(
         set(value) == expected,
         f"{label} fields are invalid: {sorted(set(value) ^ expected)}",
+    )
+
+
+def _validate_mode_transition(transition):
+    require(
+        isinstance(transition, dict),
+        "mode transition must be an object",
+    )
+    _require_exact_keys(
+        transition,
+        {"from_mode", "to_mode", "reason"},
+        "mode transition",
+    )
+    require(
+        transition.get("from_mode") in TASK_MODES,
+        "mode transition from_mode is invalid",
+    )
+    require(
+        transition.get("to_mode") in TASK_MODES,
+        "mode transition to_mode is invalid",
+    )
+    require(
+        transition["from_mode"] != transition["to_mode"],
+        "mode transition must change the mode",
+    )
+    require(
+        isinstance(transition.get("reason"), str)
+        and transition["reason"].strip(),
+        "mode transition reason is required",
     )
 
 
@@ -114,6 +205,10 @@ def validate_observation(observation, subject):
         "target_kind is invalid",
     )
     _require_id(observation.get("module_id"), "module_id")
+    require(
+        observation["module_id"] in SUBJECT_MODULES[subject],
+        "module_id must belong to session subject",
+    )
     target_id = observation.get("target_id")
     require(
         isinstance(target_id, str) and target_id.startswith(subject + "."),
@@ -160,6 +255,16 @@ def validate_observation(observation, subject):
             observation.get("first_substantive_error") is None,
             "first_substantive_error must be null for correct evidence",
         )
+    _require_optional_string(
+        observation.get("student_explanation"),
+        "student_explanation",
+    )
+    _require_timestamp(
+        observation.get("next_review_at"),
+        "next_review_at",
+        allow_none=True,
+    )
+    _require_optional_string(observation.get("uncertainty"), "uncertainty")
     if (
         observation["evidence_type"] == "transfer"
         and observation["outcome"] == "correct"
@@ -184,7 +289,9 @@ def validate_session_fact(fact):
             "supersedes_record_id",
             "status",
             "subject",
+            "task_id",
             "task_mode",
+            "mode_transitions",
             "completed_at",
             "source_materials",
             "student_attempt",
@@ -212,7 +319,14 @@ def validate_session_fact(fact):
         "status is invalid",
     )
     require(fact.get("subject") in SUBJECTS, "subject is invalid")
+    _require_id(fact.get("task_id"), "task_id")
     require(fact.get("task_mode") in TASK_MODES, "task_mode is invalid")
+    require(
+        isinstance(fact.get("mode_transitions"), list),
+        "mode_transitions must be a list",
+    )
+    for transition in fact["mode_transitions"]:
+        _validate_mode_transition(transition)
     _require_timestamp(
         fact.get("completed_at"),
         "completed_at",
@@ -235,6 +349,16 @@ def validate_session_fact(fact):
         isinstance(fact.get("observations"), list),
         "observations must be a list",
     )
+    if fact["status"] == "completed" and fact["observations"]:
+        require(
+            bool(fact["source_materials"]),
+            "source_materials requires at least one description",
+        )
+        require(
+            isinstance(fact.get("student_attempt"), str)
+            and fact["student_attempt"].strip(),
+            "student_attempt is required for completed evidence",
+        )
     require(
         isinstance(fact.get("remaining_uncertainty"), list)
         and all(
@@ -352,6 +476,16 @@ def _active_revisions(records, stable_field, validator):
             f"duplicate record_id: {record_id}",
         )
         by_record_id[record_id] = record
+    roots = {}
+    for record in records:
+        if record["supersedes_record_id"] is not None:
+            continue
+        stable_id = record[stable_field]
+        require(
+            stable_id not in roots,
+            f"duplicate {stable_field} across revision roots: {stable_id}",
+        )
+        roots[stable_id] = record["record_id"]
     for record in records:
         parent_id = record["supersedes_record_id"]
         if parent_id is None:
@@ -389,25 +523,57 @@ def _active_revisions(records, stable_field, validator):
     return leaves
 
 
-def _content_status(observation):
+def _content_status(observation, current_status, prior_evidence):
     if observation["outcome"] == "incorrect":
-        if observation["evidence_type"] == "initial_attempt":
-            return "suspected_gap"
-        return "confirmed_gap"
+        if current_status == "confirmed_gap":
+            return current_status
+        if (
+            any(
+                evidence["outcome"] == "incorrect"
+                for evidence in prior_evidence
+            )
+            and observation["evidence_type"]
+            in ("diagnostic", "correction", "variant")
+        ):
+            return "confirmed_gap"
+        if (
+            current_status
+            in ("provisionally_mastered", "stable", "transferable")
+            and observation["evidence_type"] == "diagnostic"
+        ):
+            return "confirmed_gap"
+        return "suspected_gap"
+
+    if current_status in (
+        "provisionally_mastered",
+        "stable",
+        "transferable",
+    ):
+        if (
+            observation["evidence_type"] == "delayed_retest"
+            and observation["hint_level"] == "none"
+            and current_status == "provisionally_mastered"
+        ):
+            return "stable"
+        if (
+            observation["evidence_type"] == "transfer"
+            and current_status == "stable"
+        ):
+            return "transferable"
+        return current_status
+
     if (
         observation["hint_level"] != "none"
         or observation["evidence_type"] == "correction"
     ):
         return "strengthening"
-    if observation["evidence_type"] in (
-        "initial_attempt",
-        "diagnostic",
-        "variant",
+    if (
+        observation["evidence_type"] == "variant"
+        and current_status
+        in ("suspected_gap", "confirmed_gap", "strengthening")
     ):
         return "provisionally_mastered"
-    if observation["evidence_type"] == "delayed_retest":
-        return "stable"
-    return "transferable"
+    return current_status
 
 
 def _pattern_status(observation, prior_incorrect_count):
@@ -426,7 +592,7 @@ def _new_target(observation):
         "name": observation["target_name"],
         "module_id": observation["module_id"],
         "aliases": list(observation["aliases"]),
-        "status": None,
+        "status": "unassessed",
         "evidence_ids": [],
         "last_evidence_at": None,
         "next_review_at": None,
@@ -487,6 +653,7 @@ def reconcile_state(
     }
     evidence_by_id = {}
     pattern_incorrect_counts = {}
+    content_evidence_history = {}
 
     for fact in completed_sessions:
         for observation in fact["observations"]:
@@ -507,15 +674,33 @@ def reconcile_state(
                 target_id,
                 _new_target(observation),
             )
-            target["name"] = observation["target_name"]
-            target["module_id"] = observation["module_id"]
-            target["aliases"] = list(observation["aliases"])
+            require(
+                target["name"] == observation["target_name"],
+                f"target name changed for {target_id}",
+            )
+            require(
+                target["module_id"] == observation["module_id"],
+                f"target module changed for {target_id}",
+            )
+            target["aliases"] = sorted(
+                set(target["aliases"]) | set(observation["aliases"])
+            )
             target["evidence_ids"].append(evidence_id)
             target["last_evidence_at"] = fact["completed_at"]
             target["next_review_at"] = observation["next_review_at"]
 
             if observation["target_kind"] == "knowledge_unit":
-                target["status"] = _content_status(observation)
+                history_key = (fact["subject"], target_id)
+                prior_evidence = content_evidence_history.setdefault(
+                    history_key,
+                    [],
+                )
+                target["status"] = _content_status(
+                    observation,
+                    target["status"],
+                    prior_evidence,
+                )
+                prior_evidence.append(observation)
             else:
                 prior_count = pattern_incorrect_counts.get(target_id, 0)
                 target["status"] = _pattern_status(observation, prior_count)
@@ -527,15 +712,18 @@ def reconcile_state(
         if plan_item["status"] != "completed":
             continue
         evidence = evidence_by_id.get(plan_item["completion_evidence_id"])
-        if evidence is None:
-            continue
+        require(
+            evidence is not None,
+            "completed plan item completion evidence does not exist",
+        )
         session, observation = evidence
-        if (
+        require(
             session["subject"] == plan_item["subject"]
             and observation["target_kind"] == plan_item["target_kind"]
-            and observation["target_id"] == plan_item["target_id"]
-        ):
-            completed_plan_items += 1
+            and observation["target_id"] == plan_item["target_id"],
+            "completed plan item completion evidence does not match target",
+        )
+        completed_plan_items += 1
 
     candidate = {
         "schema_version": 2,

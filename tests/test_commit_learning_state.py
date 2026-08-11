@@ -70,7 +70,7 @@ class CommitLearningStateTest(unittest.TestCase):
             unit = snapshot.state["subjects"]["mathematics"]["knowledge_units"][
                 "mathematics.geometry.dihedral-angle"
             ]
-            self.assertEqual("confirmed_gap", unit["status"])
+            self.assertEqual("suspected_gap", unit["status"])
 
     def test_completed_plan_revision_requires_and_counts_matching_evidence(self):
         session = session_fact(observations=[knowledge_observation()])

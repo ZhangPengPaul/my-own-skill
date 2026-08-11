@@ -71,7 +71,12 @@ class SummarizeProgressTest(unittest.TestCase):
                         evidence_id="evidence-002",
                         target_id="mathematics.geometry.target-confirmed",
                         target_name="已确认目标",
-                    )
+                    ),
+                    knowledge_observation(
+                        evidence_id="evidence-006",
+                        target_id="mathematics.geometry.target-confirmed",
+                        target_name="已确认目标",
+                    ),
                 ],
             )
             self.commit_session(

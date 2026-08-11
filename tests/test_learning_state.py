@@ -29,6 +29,94 @@ class FactSchemaTest(unittest.TestCase):
     def test_completed_session_may_record_direct_explanation_without_evidence(self):
         validate_session_fact(session_fact(student_attempt=None, observations=[]))
 
+    def test_session_requires_valid_task_id(self):
+        for task_id in ("", "../task"):
+            with self.subTest(task_id=task_id):
+                with self.assertRaisesRegex(ValidationError, "task_id"):
+                    validate_session_fact(session_fact(task_id=task_id))
+
+    def test_mode_transition_requires_exact_fields(self):
+        for transition in (
+            {"from_mode": "assessment", "to_mode": "practice"},
+            {
+                "from_mode": "assessment",
+                "to_mode": "practice",
+                "reason": "diagnosis completed",
+                "unexpected": True,
+            },
+        ):
+            with self.subTest(transition=transition):
+                with self.assertRaisesRegex(ValidationError, "mode transition"):
+                    validate_session_fact(
+                        session_fact(mode_transitions=[transition])
+                    )
+
+    def test_mode_transition_requires_defined_distinct_modes(self):
+        for transition in (
+            {
+                "from_mode": "unknown",
+                "to_mode": "practice",
+                "reason": "diagnosis completed",
+            },
+            {
+                "from_mode": "assessment",
+                "to_mode": "unknown",
+                "reason": "diagnosis completed",
+            },
+            {
+                "from_mode": "practice",
+                "to_mode": "practice",
+                "reason": "diagnosis completed",
+            },
+        ):
+            with self.subTest(transition=transition):
+                with self.assertRaisesRegex(ValidationError, "mode transition"):
+                    validate_session_fact(
+                        session_fact(mode_transitions=[transition])
+                    )
+
+    def test_mode_transition_requires_nonempty_reason(self):
+        transition = {
+            "from_mode": "assessment",
+            "to_mode": "practice",
+            "reason": "",
+        }
+
+        with self.assertRaisesRegex(ValidationError, "reason"):
+            validate_session_fact(session_fact(mode_transitions=[transition]))
+
+    def test_valid_mode_transition_is_accepted(self):
+        validate_session_fact(
+            session_fact(
+                mode_transitions=[
+                    {
+                        "from_mode": "assessment",
+                        "to_mode": "practice",
+                        "reason": "diagnosis completed",
+                    }
+                ]
+            )
+        )
+
+    def test_completed_session_observations_require_source_description(self):
+        fact = session_fact(
+            source_materials=[],
+            observations=[knowledge_observation()],
+        )
+
+        with self.assertRaisesRegex(ValidationError, "source_materials"):
+            validate_session_fact(fact)
+
+    def test_completed_session_observations_require_student_attempt(self):
+        for student_attempt in (None, ""):
+            with self.subTest(student_attempt=student_attempt):
+                fact = session_fact(
+                    student_attempt=student_attempt,
+                    observations=[knowledge_observation()],
+                )
+                with self.assertRaisesRegex(ValidationError, "student_attempt"):
+                    validate_session_fact(fact)
+
     def test_observation_requires_nonempty_student_response(self):
         fact = session_fact(
             observations=[knowledge_observation(student_response="")]
@@ -49,6 +137,48 @@ class FactSchemaTest(unittest.TestCase):
             ]
         )
         with self.assertRaisesRegex(ValidationError, "transfer"):
+            validate_session_fact(fact)
+
+    def test_optional_observation_strings_reject_empty_values(self):
+        for field in ("student_explanation", "uncertainty"):
+            with self.subTest(field=field):
+                fact = session_fact(
+                    observations=[knowledge_observation(**{field: ""})]
+                )
+                with self.assertRaisesRegex(ValidationError, field):
+                    validate_session_fact(fact)
+
+    def test_next_review_at_must_be_null_or_iso_timestamp(self):
+        fact = session_fact(
+            observations=[knowledge_observation(next_review_at="tomorrow")]
+        )
+
+        with self.assertRaisesRegex(ValidationError, "next_review_at"):
+            validate_session_fact(fact)
+
+    def test_observation_module_must_belong_to_session_subject(self):
+        valid_modules = {
+            "chinese": "modern-reading",
+            "mathematics": "geometry",
+            "english": "reading",
+            "politics": "material-analysis",
+            "history": "source-analysis",
+            "geography": "maps-and-space",
+        }
+        for subject, module_id in valid_modules.items():
+            observation = knowledge_observation(
+                module_id=module_id,
+                target_id=f"{subject}.{module_id}.target",
+            )
+            with self.subTest(subject=subject, module_id=module_id):
+                validate_session_fact(
+                    session_fact(subject=subject, observations=[observation])
+                )
+
+        fact = session_fact(
+            observations=[knowledge_observation(module_id="reading")]
+        )
+        with self.assertRaisesRegex(ValidationError, "module_id"):
             validate_session_fact(fact)
 
     def test_record_and_stable_ids_reject_path_characters(self):
@@ -95,6 +225,321 @@ class ReconciliationTest(unittest.TestCase):
         ]
         self.assertEqual("suspected_gap", unit["status"])
 
+    def test_single_diagnostic_error_remains_suspected(self):
+        fact = session_fact(observations=[knowledge_observation()])
+
+        state = reconcile_state("student-a", [fact], [], now=NOW)
+
+        unit = state["subjects"]["mathematics"]["knowledge_units"][
+            "mathematics.geometry.dihedral-angle"
+        ]
+        self.assertEqual("suspected_gap", unit["status"])
+
+    def test_first_error_after_unassessed_success_remains_suspected(self):
+        success = session_fact(
+            observations=[
+                knowledge_observation(
+                    outcome="correct",
+                    hint_level="none",
+                    first_substantive_error=None,
+                )
+            ]
+        )
+        failure = session_fact(
+            record_id="record-session-002",
+            session_id="session-002",
+            completed_at="2026-08-06T10:10:00+00:00",
+            observations=[knowledge_observation(evidence_id="evidence-002")],
+        )
+
+        state = reconcile_state("student-a", [success, failure], [], now=NOW)
+
+        unit = state["subjects"]["mathematics"]["knowledge_units"][
+            "mathematics.geometry.dihedral-angle"
+        ]
+        self.assertEqual("suspected_gap", unit["status"])
+
+    def test_second_matching_error_confirms_gap(self):
+        first = session_fact(
+            observations=[
+                knowledge_observation(evidence_type="initial_attempt")
+            ]
+        )
+        second = session_fact(
+            record_id="record-session-002",
+            session_id="session-002",
+            completed_at="2026-08-06T10:10:00+00:00",
+            observations=[knowledge_observation(evidence_id="evidence-002")],
+        )
+
+        state = reconcile_state("student-a", [first, second], [], now=NOW)
+
+        unit = state["subjects"]["mathematics"]["knowledge_units"][
+            "mathematics.geometry.dihedral-angle"
+        ]
+        self.assertEqual("confirmed_gap", unit["status"])
+
+    def test_initial_or_diagnostic_success_does_not_claim_provisional_mastery(self):
+        for evidence_type in ("initial_attempt", "diagnostic"):
+            with self.subTest(evidence_type=evidence_type):
+                fact = session_fact(
+                    observations=[
+                        knowledge_observation(
+                            evidence_type=evidence_type,
+                            outcome="correct",
+                            hint_level="none",
+                            first_substantive_error=None,
+                        )
+                    ]
+                )
+                state = reconcile_state("student-a", [fact], [], now=NOW)
+                unit = state["subjects"]["mathematics"]["knowledge_units"][
+                    "mathematics.geometry.dihedral-angle"
+                ]
+                self.assertEqual("unassessed", unit["status"])
+
+    def test_successful_variant_requires_prior_gap_or_strengthening(self):
+        variant = knowledge_observation(
+            evidence_type="variant",
+            outcome="correct",
+            hint_level="none",
+            first_substantive_error=None,
+        )
+        without_prior_gap = session_fact(observations=[variant])
+        state = reconcile_state(
+            "student-a", [without_prior_gap], [], now=NOW
+        )
+        target_id = "mathematics.geometry.dihedral-angle"
+        self.assertEqual(
+            "unassessed",
+            state["subjects"]["mathematics"]["knowledge_units"][target_id][
+                "status"
+            ],
+        )
+
+        gap = session_fact(
+            observations=[knowledge_observation(evidence_type="initial_attempt")]
+        )
+        after_gap = session_fact(
+            record_id="record-session-002",
+            session_id="session-002",
+            completed_at="2026-08-06T10:10:00+00:00",
+            observations=[
+                dict(variant, evidence_id="evidence-002")
+            ],
+        )
+        state = reconcile_state("student-a", [gap, after_gap], [], now=NOW)
+        self.assertEqual(
+            "provisionally_mastered",
+            state["subjects"]["mathematics"]["knowledge_units"][target_id][
+                "status"
+            ],
+        )
+
+    def test_successful_variant_does_not_lower_stable(self):
+        gap = session_fact(
+            observations=[knowledge_observation(evidence_type="initial_attempt")]
+        )
+        variant = session_fact(
+            record_id="record-session-002",
+            session_id="session-002",
+            completed_at="2026-08-06T10:10:00+00:00",
+            observations=[
+                knowledge_observation(
+                    evidence_id="evidence-002",
+                    evidence_type="variant",
+                    outcome="correct",
+                    hint_level="none",
+                    first_substantive_error=None,
+                )
+            ],
+        )
+        delayed = session_fact(
+            record_id="record-session-003",
+            session_id="session-003",
+            completed_at="2026-08-06T10:20:00+00:00",
+            observations=[
+                knowledge_observation(
+                    evidence_id="evidence-003",
+                    evidence_type="delayed_retest",
+                    outcome="correct",
+                    hint_level="none",
+                    first_substantive_error=None,
+                )
+            ],
+        )
+        later_variant = session_fact(
+            record_id="record-session-004",
+            session_id="session-004",
+            completed_at="2026-08-06T10:30:00+00:00",
+            observations=[
+                knowledge_observation(
+                    evidence_id="evidence-004",
+                    evidence_type="variant",
+                    outcome="correct",
+                    hint_level="none",
+                    first_substantive_error=None,
+                )
+            ],
+        )
+
+        state = reconcile_state(
+            "student-a", [gap, variant, delayed, later_variant], [], now=NOW
+        )
+
+        unit = state["subjects"]["mathematics"]["knowledge_units"][
+            "mathematics.geometry.dihedral-angle"
+        ]
+        self.assertEqual("stable", unit["status"])
+
+    def test_delayed_retest_requires_prior_provisional_mastery(self):
+        delayed = session_fact(
+            observations=[
+                knowledge_observation(
+                    evidence_type="delayed_retest",
+                    outcome="correct",
+                    hint_level="none",
+                    first_substantive_error=None,
+                )
+            ]
+        )
+
+        state = reconcile_state("student-a", [delayed], [], now=NOW)
+
+        unit = state["subjects"]["mathematics"]["knowledge_units"][
+            "mathematics.geometry.dihedral-angle"
+        ]
+        self.assertEqual("unassessed", unit["status"])
+
+    def test_hinted_delayed_retest_does_not_promote_provisional_mastery(self):
+        gap = session_fact(
+            observations=[knowledge_observation(evidence_type="initial_attempt")]
+        )
+        variant = session_fact(
+            record_id="record-session-002",
+            session_id="session-002",
+            completed_at="2026-08-06T10:10:00+00:00",
+            observations=[
+                knowledge_observation(
+                    evidence_id="evidence-002",
+                    evidence_type="variant",
+                    outcome="correct",
+                    hint_level="none",
+                    first_substantive_error=None,
+                )
+            ],
+        )
+        hinted_retest = session_fact(
+            record_id="record-session-003",
+            session_id="session-003",
+            completed_at="2026-08-06T10:20:00+00:00",
+            observations=[
+                knowledge_observation(
+                    evidence_id="evidence-003",
+                    evidence_type="delayed_retest",
+                    outcome="correct",
+                    hint_level="principle",
+                    first_substantive_error=None,
+                )
+            ],
+        )
+
+        state = reconcile_state(
+            "student-a", [gap, variant, hinted_retest], [], now=NOW
+        )
+
+        unit = state["subjects"]["mathematics"]["knowledge_units"][
+            "mathematics.geometry.dihedral-angle"
+        ]
+        self.assertEqual("provisionally_mastered", unit["status"])
+
+    def test_transfer_requires_prior_stable_state(self):
+        gap = session_fact(
+            observations=[knowledge_observation(evidence_type="initial_attempt")]
+        )
+        variant = session_fact(
+            record_id="record-session-002",
+            session_id="session-002",
+            completed_at="2026-08-06T10:10:00+00:00",
+            observations=[
+                knowledge_observation(
+                    evidence_id="evidence-002",
+                    evidence_type="variant",
+                    outcome="correct",
+                    hint_level="none",
+                    first_substantive_error=None,
+                )
+            ],
+        )
+        transfer = session_fact(
+            record_id="record-session-003",
+            session_id="session-003",
+            completed_at="2026-08-06T10:20:00+00:00",
+            observations=[
+                knowledge_observation(
+                    evidence_id="evidence-003",
+                    evidence_type="transfer",
+                    outcome="correct",
+                    hint_level="none",
+                    first_substantive_error=None,
+                    student_explanation="fictional explanation",
+                )
+            ],
+        )
+
+        state = reconcile_state(
+            "student-a", [gap, variant, transfer], [], now=NOW
+        )
+        target_id = "mathematics.geometry.dihedral-angle"
+        self.assertEqual(
+            "provisionally_mastered",
+            state["subjects"]["mathematics"]["knowledge_units"][target_id][
+                "status"
+            ],
+        )
+
+        delayed = session_fact(
+            record_id="record-session-004",
+            session_id="session-004",
+            completed_at="2026-08-06T10:30:00+00:00",
+            observations=[
+                knowledge_observation(
+                    evidence_id="evidence-004",
+                    evidence_type="delayed_retest",
+                    outcome="correct",
+                    hint_level="none",
+                    first_substantive_error=None,
+                )
+            ],
+        )
+        later_transfer = session_fact(
+            record_id="record-session-005",
+            session_id="session-005",
+            completed_at="2026-08-06T10:40:00+00:00",
+            observations=[
+                knowledge_observation(
+                    evidence_id="evidence-005",
+                    evidence_type="transfer",
+                    outcome="correct",
+                    hint_level="none",
+                    first_substantive_error=None,
+                    student_explanation="fictional explanation",
+                )
+            ],
+        )
+        state = reconcile_state(
+            "student-a",
+            [gap, variant, delayed, later_transfer],
+            [],
+            now=NOW,
+        )
+        self.assertEqual(
+            "transferable",
+            state["subjects"]["mathematics"]["knowledge_units"][target_id][
+                "status"
+            ],
+        )
+
     def test_diagnostic_error_confirms_gap_and_variant_does_not_skip_hint_rule(self):
         first = session_fact(observations=[knowledge_observation()])
         second = session_fact(
@@ -119,27 +564,6 @@ class ReconciliationTest(unittest.TestCase):
         ]
         self.assertEqual("strengthening", unit["status"])
 
-    def test_delayed_no_hint_success_is_stable(self):
-        fact = session_fact(
-            observations=[
-                knowledge_observation(
-                    evidence_type="delayed_retest",
-                    outcome="correct",
-                    hint_level="none",
-                    first_substantive_error=None,
-                )
-            ]
-        )
-
-        state = reconcile_state("student-a", [fact], [], now=NOW)
-
-        self.assertEqual(
-            "stable",
-            state["subjects"]["mathematics"]["knowledge_units"][
-                "mathematics.geometry.dihedral-angle"
-            ]["status"],
-        )
-
     def test_plan_completion_requires_matching_active_evidence(self):
         session = session_fact(
             observations=[
@@ -160,7 +584,7 @@ class ReconciliationTest(unittest.TestCase):
 
         self.assertEqual(1, state["process"]["completed_plan_items"])
 
-    def test_mismatched_plan_completion_evidence_is_not_counted(self):
+    def test_completed_plan_rejects_missing_or_mismatched_evidence(self):
         session = session_fact(
             observations=[
                 knowledge_observation(
@@ -171,19 +595,25 @@ class ReconciliationTest(unittest.TestCase):
                 )
             ]
         )
-        for mismatch in (
+        invalid_plans = (
+            {"completion_evidence_id": "evidence-missing"},
             {"subject": "english", "target_id": "english.reading.inference"},
             {"target_kind": "pattern"},
             {"target_id": "mathematics.geometry.line-plane-perpendicular"},
-        ):
-            with self.subTest(mismatch=mismatch):
+        )
+        for overrides in invalid_plans:
+            with self.subTest(overrides=overrides):
                 plan = plan_fact(
-                    status="completed",
-                    completion_evidence_id="evidence-001",
-                    **mismatch,
+                    **{
+                        "status": "completed",
+                        "completion_evidence_id": "evidence-001",
+                        **overrides,
+                    }
                 )
-                state = reconcile_state("student-a", [session], [plan], now=NOW)
-                self.assertEqual(0, state["process"]["completed_plan_items"])
+                with self.assertRaisesRegex(
+                    ValidationError, "completion evidence"
+                ):
+                    reconcile_state("student-a", [session], [plan], now=NOW)
 
     def test_revision_chain_rejects_fork(self):
         root = session_fact(status="incomplete")
@@ -249,6 +679,60 @@ class ReconciliationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "evidence_id"):
             reconcile_state("student-a", [first, second], [], now=NOW)
 
+    def test_duplicate_session_id_across_unrelated_roots_is_rejected(self):
+        first = session_fact(record_id="record-first")
+        second = session_fact(record_id="record-second")
+
+        with self.assertRaisesRegex(ValidationError, "session-001"):
+            reconcile_state("student-a", [first, second], [], now=NOW)
+
+    def test_target_canonical_name_and_module_are_stable(self):
+        first = session_fact(observations=[knowledge_observation()])
+        changes = (
+            {"target_name": "Changed canonical name"},
+            {"module_id": "algebra-and-functions"},
+        )
+        for index, change in enumerate(changes, start=2):
+            with self.subTest(change=change):
+                second = session_fact(
+                    record_id=f"record-session-00{index}",
+                    session_id=f"session-00{index}",
+                    completed_at="2026-08-06T10:10:00+00:00",
+                    observations=[
+                        knowledge_observation(
+                            evidence_id=f"evidence-00{index}",
+                            **change,
+                        )
+                    ],
+                )
+                with self.assertRaisesRegex(
+                    ValidationError, "target (name|module)"
+                ):
+                    reconcile_state("student-a", [first, second], [], now=NOW)
+
+    def test_target_aliases_are_merged_as_sorted_union(self):
+        first = session_fact(
+            observations=[knowledge_observation(aliases=["beta", "alpha"])]
+        )
+        second = session_fact(
+            record_id="record-session-002",
+            session_id="session-002",
+            completed_at="2026-08-06T10:10:00+00:00",
+            observations=[
+                knowledge_observation(
+                    evidence_id="evidence-002",
+                    aliases=["gamma", "alpha"],
+                )
+            ],
+        )
+
+        state = reconcile_state("student-a", [first, second], [], now=NOW)
+
+        unit = state["subjects"]["mathematics"]["knowledge_units"][
+            "mathematics.geometry.dihedral-angle"
+        ]
+        self.assertEqual(["alpha", "beta", "gamma"], unit["aliases"])
+
     def test_pattern_progresses_from_once_to_recurring_to_controlled(self):
         first = session_fact(observations=[pattern_observation()])
         second = session_fact(
@@ -285,9 +769,30 @@ class ReconciliationTest(unittest.TestCase):
         self.assertEqual(["observed_once", "recurring", "controlled"], states)
 
     def test_later_diagnostic_failure_lowers_stable_mastery(self):
-        stable = session_fact(
+        gap = session_fact(
+            observations=[knowledge_observation(evidence_type="initial_attempt")]
+        )
+        variant = session_fact(
+            record_id="record-session-002",
+            session_id="session-002",
+            completed_at="2026-08-06T10:10:00+00:00",
             observations=[
                 knowledge_observation(
+                    evidence_id="evidence-002",
+                    evidence_type="variant",
+                    outcome="correct",
+                    hint_level="none",
+                    first_substantive_error=None,
+                )
+            ]
+        )
+        stable = session_fact(
+            record_id="record-session-003",
+            session_id="session-003",
+            completed_at="2026-08-06T10:20:00+00:00",
+            observations=[
+                knowledge_observation(
+                    evidence_id="evidence-003",
                     evidence_type="delayed_retest",
                     outcome="correct",
                     hint_level="none",
@@ -296,13 +801,15 @@ class ReconciliationTest(unittest.TestCase):
             ]
         )
         failure = session_fact(
-            record_id="record-session-002",
-            session_id="session-002",
-            completed_at="2026-08-06T10:10:00+00:00",
-            observations=[knowledge_observation(evidence_id="evidence-002")],
+            record_id="record-session-004",
+            session_id="session-004",
+            completed_at="2026-08-06T10:30:00+00:00",
+            observations=[knowledge_observation(evidence_id="evidence-004")],
         )
 
-        state = reconcile_state("student-a", [stable, failure], [], now=NOW)
+        state = reconcile_state(
+            "student-a", [gap, variant, stable, failure], [], now=NOW
+        )
 
         unit = state["subjects"]["mathematics"]["knowledge_units"][
             "mathematics.geometry.dihedral-angle"

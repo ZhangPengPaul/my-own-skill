@@ -12,7 +12,9 @@ def session_fact(**overrides):
         "supersedes_record_id": None,
         "status": "completed",
         "subject": "mathematics",
+        "task_id": "task-001",
         "task_mode": "practice",
+        "mode_transitions": [],
         "completed_at": "2026-08-06T10:00:00+00:00",
         "source_materials": ["fictional prompt"],
         "student_attempt": "fictional student attempt",
@@ -47,7 +49,7 @@ def knowledge_observation(**overrides):
 def pattern_observation(**overrides):
     value = knowledge_observation(
         target_kind="pattern",
-        module_id="reasoning",
+        module_id="geometry",
         target_id="mathematics.pattern.method-selection",
         target_name="方法选择",
     )

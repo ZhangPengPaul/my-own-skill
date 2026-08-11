@@ -181,7 +181,7 @@ class CommitLearningStateTest(unittest.TestCase):
                 ],
             )
 
-    def test_successful_publish_persists_link_before_temporary_cleanup(self):
+    def test_successful_publish_fsyncs_final_before_directory_and_cleanup(self):
         fact = session_fact(observations=[knowledge_observation()])
         with tempfile.TemporaryDirectory() as tmp:
             fact_directory = Path(tmp)
@@ -192,18 +192,29 @@ class CommitLearningStateTest(unittest.TestCase):
             events = []
             real_fsync = os.fsync
             real_unlink = os.unlink
+            real_publish = commit_learning_state._publish_held_file_no_clobber
             final_path = fact_directory / "record-session-001.json"
 
+            def tracked_publish(source_fd, target_directory_fd, filename):
+                result = real_publish(source_fd, target_directory_fd, filename)
+                events.append("publish-final")
+                return result
+
             def tracked_fsync(file_fd):
-                if (
-                    file_fd == directory_fd
-                    and final_path.exists()
-                    and "publish-final" not in events
-                ):
-                    events.append("publish-final")
                 result = real_fsync(file_fd)
                 if file_fd == directory_fd:
                     events.append("fsync-directory")
+                elif final_path.exists():
+                    final_entry = final_path.stat()
+                    synced_entry = os.fstat(file_fd)
+                    if (
+                        synced_entry.st_dev,
+                        synced_entry.st_ino,
+                    ) == (
+                        final_entry.st_dev,
+                        final_entry.st_ino,
+                    ):
+                        events.append("fsync-final")
                 return result
 
             def tracked_unlink(path, *args, **kwargs):
@@ -214,6 +225,10 @@ class CommitLearningStateTest(unittest.TestCase):
 
             try:
                 with mock.patch.object(
+                    commit_learning_state,
+                    "_publish_held_file_no_clobber",
+                    side_effect=tracked_publish,
+                ), mock.patch.object(
                     commit_learning_state.os,
                     "fsync",
                     side_effect=tracked_fsync,
@@ -233,6 +248,7 @@ class CommitLearningStateTest(unittest.TestCase):
             self.assertEqual(
                 [
                     "publish-final",
+                    "fsync-final",
                     "fsync-directory",
                     "unlink-temporary",
                     "fsync-directory",
@@ -295,6 +311,77 @@ class CommitLearningStateTest(unittest.TestCase):
             self.assertFalse(published)
             self.assertEqual(1, snapshot.state["process"]["recorded_sessions"])
             self.assertEqual(LATER, snapshot.state["updated_at"])
+            self.assertEqual(
+                ["record-session-001.json"],
+                sorted(path.name for path in fact_directory.iterdir()),
+            )
+
+    def test_final_fsync_failure_retry_fsyncs_existing_final(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        with tempfile.TemporaryDirectory() as tmp:
+            fact_directory = Path(tmp)
+            directory_fd = os.open(
+                fact_directory,
+                os.O_RDONLY | os.O_DIRECTORY,
+            )
+            final_path = fact_directory / "record-session-001.json"
+            real_fsync = os.fsync
+            failed_final_fsync = False
+
+            def fail_first_final_fsync(file_fd):
+                nonlocal failed_final_fsync
+                entry = os.fstat(file_fd)
+                if final_path.exists():
+                    final_entry = final_path.stat()
+                    if (
+                        not failed_final_fsync
+                        and (entry.st_dev, entry.st_ino)
+                        == (final_entry.st_dev, final_entry.st_ino)
+                    ):
+                        failed_final_fsync = True
+                        raise OSError("fictional final inode fsync failure")
+                return real_fsync(file_fd)
+
+            try:
+                with mock.patch.object(
+                    commit_learning_state.os,
+                    "fsync",
+                    side_effect=fail_first_final_fsync,
+                ):
+                    with self.assertRaisesRegex(OSError, "final inode fsync"):
+                        commit_learning_state._publish_fact_no_clobber(
+                            directory_fd,
+                            fact,
+                        )
+
+                retried_final_fsyncs = 0
+
+                def track_retry_final_fsync(file_fd):
+                    nonlocal retried_final_fsyncs
+                    entry = os.fstat(file_fd)
+                    final_entry = final_path.stat()
+                    if (entry.st_dev, entry.st_ino) == (
+                        final_entry.st_dev,
+                        final_entry.st_ino,
+                    ):
+                        retried_final_fsyncs += 1
+                    return real_fsync(file_fd)
+
+                with mock.patch.object(
+                    commit_learning_state.os,
+                    "fsync",
+                    side_effect=track_retry_final_fsync,
+                ):
+                    published = commit_learning_state._publish_fact_no_clobber(
+                        directory_fd,
+                        fact,
+                    )
+            finally:
+                os.close(directory_fd)
+
+            self.assertTrue(failed_final_fsync)
+            self.assertFalse(published)
+            self.assertEqual(1, retried_final_fsyncs)
             self.assertEqual(
                 ["record-session-001.json"],
                 sorted(path.name for path in fact_directory.iterdir()),

@@ -60,6 +60,8 @@ def _name_identity(directory_fd, name):
 
 
 def _unlink_if_identity_matches(directory_fd, name, expected_identity):
+    # Callers rely on the workspace flock and UUID names for cooperative
+    # concurrency; only entries matching at check time are cleaned up here.
     if (
         expected_identity is None
         or _name_identity(directory_fd, name) != expected_identity
@@ -86,7 +88,7 @@ def _publish_held_file_no_clobber(source_fd, directory_fd, filename):
         ctypes.c_int,
         ctypes.c_int,
         ctypes.c_char_p,
-        ctypes.c_uint32,
+        ctypes.c_int,
     ]
     clone_file.restype = ctypes.c_int
     ctypes.set_errno(0)
@@ -176,13 +178,14 @@ def _publish_fact_no_clobber(directory_fd, fact):
             existing_fd = _open_existing_regular(directory_fd, filename)
             try:
                 existing = _read_all(existing_fd)
+                if existing != data:
+                    raise ValidationError(
+                        "record_id conflicts with an existing immutable fact: %s"
+                        % fact["record_id"]
+                    )
+                os.fsync(existing_fd)
             finally:
                 os.close(existing_fd)
-            if existing != data:
-                raise ValidationError(
-                    "record_id conflicts with an existing immutable fact: %s"
-                    % fact["record_id"]
-                )
             published = False
 
         if published:
@@ -193,6 +196,7 @@ def _publish_fact_no_clobber(directory_fd, fact):
                 raise ValidationError(
                     "published fact content or identity changed"
                 )
+            os.fsync(published_fd)
 
         os.close(source_fd)
         source_fd = None

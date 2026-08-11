@@ -316,6 +316,29 @@ def commit_fact(workspace, fact, now=None):
                     "record_id conflicts with an existing immutable fact: %s"
                     % fact["record_id"]
                 )
+        commit_time = now or datetime.now(timezone.utc).isoformat()
+        prospective_sessions = list(snapshot.sessions)
+        prospective_plan_items = list(snapshot.plan_items)
+        if existing is None:
+            prospective = (
+                prospective_sessions
+                if fact["record_type"] == "session"
+                else prospective_plan_items
+            )
+            prospective.append(fact)
+        candidate = reconcile_state(
+            snapshot.state["student_id"],
+            prospective_sessions,
+            prospective_plan_items,
+            previous_state=snapshot.state,
+            now=commit_time,
+        )
+        validate_state(
+            candidate,
+            prospective_sessions,
+            prospective_plan_items,
+        )
+
         directory_name = (
             "sessions" if fact["record_type"] == "session" else "plan-items"
         )
@@ -330,7 +353,7 @@ def commit_fact(workspace, fact, now=None):
             snapshot.sessions,
             snapshot.plan_items,
             previous_state=snapshot.state,
-            now=now or datetime.now(timezone.utc).isoformat(),
+            now=commit_time,
         )
         validate_state(candidate, snapshot.sessions, snapshot.plan_items)
         if candidate != snapshot.state:

@@ -72,6 +72,38 @@ class CommitLearningStateTest(unittest.TestCase):
             ]
             self.assertEqual("suspected_gap", unit["status"])
 
+    def test_implicit_commit_time_is_computed_once_and_reused(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        first_clock_value = mock.Mock()
+        first_clock_value.isoformat.return_value = NOW
+        second_clock_value = mock.Mock()
+        second_clock_value.isoformat.return_value = LATER
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+
+            with mock.patch.object(
+                commit_learning_state,
+                "datetime",
+            ) as datetime_type, mock.patch.object(
+                commit_learning_state,
+                "reconcile_state",
+                wraps=commit_learning_state.reconcile_state,
+            ) as reconcile:
+                datetime_type.now.side_effect = [
+                    first_clock_value,
+                    second_clock_value,
+                ]
+                commit_fact(workspace, fact)
+
+            datetime_type.now.assert_called_once_with(
+                commit_learning_state.timezone.utc
+            )
+            self.assertEqual(2, reconcile.call_count)
+            self.assertEqual(
+                [NOW, NOW],
+                [call.kwargs["now"] for call in reconcile.call_args_list],
+            )
+
     def test_completed_plan_revision_requires_and_counts_matching_evidence(self):
         session = session_fact(observations=[knowledge_observation()])
         pending = plan_fact()
@@ -592,6 +624,31 @@ class CommitLearningStateTest(unittest.TestCase):
                 (workspace / "state.json").read_bytes(),
             )
             validate_workspace(workspace)
+
+    def test_history_conflict_is_rejected_before_fact_publication(self):
+        original = session_fact(observations=[knowledge_observation()])
+        conflicting = session_fact(
+            record_id="record-session-002",
+            completed_at="2026-08-06T10:10:00+00:00",
+            observations=[knowledge_observation(evidence_id="evidence-002")],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            commit_fact(workspace, original, now=NOW)
+            state_before = (workspace / "state.json").read_bytes()
+            conflicting_path = workspace / "sessions/record-session-002.json"
+
+            with self.assertRaisesRegex(ValidationError, "duplicate session_id"):
+                commit_fact(workspace, conflicting, now=LATER)
+
+            self.assertFalse(conflicting_path.exists())
+            self.assertEqual(
+                state_before,
+                (workspace / "state.json").read_bytes(),
+            )
+            snapshot = validate_workspace(workspace)
+            self.assertEqual(1, len(snapshot.sessions))
+            self.assertEqual(1, snapshot.state["process"]["recorded_sessions"])
 
     def test_existing_cross_type_duplicate_is_rejected_before_publish(self):
         session = session_fact(observations=[knowledge_observation()])

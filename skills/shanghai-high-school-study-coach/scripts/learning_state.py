@@ -567,7 +567,13 @@ def _content_status(observation, current_status, prior_evidence):
                 for evidence in prior_evidence
             )
             and observation["evidence_type"]
-            in ("diagnostic", "correction", "variant")
+            in (
+                "diagnostic",
+                "correction",
+                "variant",
+                "delayed_retest",
+                "transfer",
+            )
         ):
             return "confirmed_gap"
         return "suspected_gap"

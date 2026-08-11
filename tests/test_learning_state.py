@@ -451,6 +451,61 @@ class ReconciliationTest(unittest.TestCase):
         ]
         self.assertEqual("confirmed_gap", unit["status"])
 
+    def test_failed_mastery_check_after_prior_error_confirms_gap(self):
+        first = session_fact(
+            observations=[
+                knowledge_observation(evidence_type="initial_attempt")
+            ]
+        )
+        correction = session_fact(
+            record_id="record-session-002",
+            session_id="session-002",
+            completed_at="2026-08-06T10:10:00+00:00",
+            observations=[
+                knowledge_observation(
+                    evidence_id="evidence-002",
+                    evidence_type="correction",
+                    outcome="correct",
+                    hint_level="principle",
+                    first_substantive_error=None,
+                )
+            ],
+        )
+        target_id = "mathematics.geometry.dihedral-angle"
+        corrected = reconcile_state(
+            "student-a", [first, correction], [], now=NOW
+        )
+        self.assertEqual(
+            "strengthening",
+            corrected["subjects"]["mathematics"]["knowledge_units"][
+                target_id
+            ]["status"],
+        )
+
+        for evidence_type in ("delayed_retest", "transfer"):
+            with self.subTest(evidence_type=evidence_type):
+                failed_check = session_fact(
+                    record_id="record-session-003",
+                    session_id="session-003",
+                    completed_at="2026-08-06T10:20:00+00:00",
+                    observations=[
+                        knowledge_observation(
+                            evidence_id="evidence-003",
+                            evidence_type=evidence_type,
+                        )
+                    ],
+                )
+                state = reconcile_state(
+                    "student-a",
+                    [first, correction, failed_check],
+                    [],
+                    now=NOW,
+                )
+                unit = state["subjects"]["mathematics"]["knowledge_units"][
+                    target_id
+                ]
+                self.assertEqual("confirmed_gap", unit["status"])
+
     def test_initial_or_diagnostic_success_does_not_claim_provisional_mastery(self):
         for evidence_type in ("initial_attempt", "diagnostic"):
             with self.subTest(evidence_type=evidence_type):

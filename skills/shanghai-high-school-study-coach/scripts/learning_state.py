@@ -327,6 +327,19 @@ def validate_session_fact(fact):
     )
     for transition in fact["mode_transitions"]:
         _validate_mode_transition(transition)
+    for previous, current in zip(
+        fact["mode_transitions"],
+        fact["mode_transitions"][1:],
+    ):
+        require(
+            previous["to_mode"] == current["from_mode"],
+            "mode transition chain is not contiguous",
+        )
+    if fact["mode_transitions"]:
+        require(
+            fact["mode_transitions"][-1]["to_mode"] == fact["task_mode"],
+            "last mode transition to_mode must match task_mode",
+        )
     _require_timestamp(
         fact.get("completed_at"),
         "completed_at",
@@ -654,6 +667,7 @@ def reconcile_state(
     evidence_by_id = {}
     pattern_incorrect_counts = {}
     content_evidence_history = {}
+    target_identities = {}
 
     for fact in completed_sessions:
         for observation in fact["observations"]:
@@ -663,24 +677,30 @@ def reconcile_state(
                 f"duplicate active evidence_id: {evidence_id}",
             )
             evidence_by_id[evidence_id] = (fact, observation)
+            target_id = observation["target_id"]
+            identity_key = (fact["subject"], target_id)
+            identity = (
+                observation["target_kind"],
+                observation["target_name"],
+                observation["module_id"],
+            )
+            previous_identity = target_identities.setdefault(
+                identity_key,
+                identity,
+            )
+            require(
+                previous_identity == identity,
+                f"target identity changed for {target_id}",
+            )
             collection_name = (
                 "knowledge_units"
                 if observation["target_kind"] == "knowledge_unit"
                 else "patterns"
             )
             collection = subjects[fact["subject"]][collection_name]
-            target_id = observation["target_id"]
             target = collection.setdefault(
                 target_id,
                 _new_target(observation),
-            )
-            require(
-                target["name"] == observation["target_name"],
-                f"target name changed for {target_id}",
-            )
-            require(
-                target["module_id"] == observation["module_id"],
-                f"target module changed for {target_id}",
             )
             target["aliases"] = sorted(
                 set(target["aliases"]) | set(observation["aliases"])

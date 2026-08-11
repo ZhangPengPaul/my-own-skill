@@ -91,12 +91,44 @@ class FactSchemaTest(unittest.TestCase):
                 mode_transitions=[
                     {
                         "from_mode": "assessment",
-                        "to_mode": "practice",
+                        "to_mode": "explanation",
                         "reason": "diagnosis completed",
+                    },
+                    {
+                        "from_mode": "explanation",
+                        "to_mode": "practice",
+                        "reason": "guided explanation completed",
                     }
                 ]
             )
         )
+
+    def test_mode_transition_chain_must_be_contiguous(self):
+        transitions = [
+            {
+                "from_mode": "assessment",
+                "to_mode": "explanation",
+                "reason": "diagnosis completed",
+            },
+            {
+                "from_mode": "grading",
+                "to_mode": "practice",
+                "reason": "practice selected",
+            },
+        ]
+
+        with self.assertRaisesRegex(ValidationError, "mode transition chain"):
+            validate_session_fact(session_fact(mode_transitions=transitions))
+
+    def test_last_mode_transition_must_match_task_mode(self):
+        transition = {
+            "from_mode": "assessment",
+            "to_mode": "explanation",
+            "reason": "diagnosis completed",
+        }
+
+        with self.assertRaisesRegex(ValidationError, "task_mode"):
+            validate_session_fact(session_fact(mode_transitions=[transition]))
 
     def test_completed_session_observations_require_source_description(self):
         fact = session_fact(
@@ -686,9 +718,10 @@ class ReconciliationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "session-001"):
             reconcile_state("student-a", [first, second], [], now=NOW)
 
-    def test_target_canonical_name_and_module_are_stable(self):
+    def test_target_kind_name_and_module_are_globally_stable(self):
         first = session_fact(observations=[knowledge_observation()])
         changes = (
+            {"target_kind": "pattern"},
             {"target_name": "Changed canonical name"},
             {"module_id": "algebra-and-functions"},
         )
@@ -705,9 +738,7 @@ class ReconciliationTest(unittest.TestCase):
                         )
                     ],
                 )
-                with self.assertRaisesRegex(
-                    ValidationError, "target (name|module)"
-                ):
+                with self.assertRaisesRegex(ValidationError, "target identity"):
                     reconcile_state("student-a", [first, second], [], now=NOW)
 
     def test_target_aliases_are_merged_as_sorted_union(self):

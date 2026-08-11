@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import uuid
 
@@ -45,6 +46,28 @@ def _read_all(file_fd):
         chunks.append(chunk)
 
 
+def _entry_identity(entry):
+    return (entry.st_dev, entry.st_ino, stat.S_IFMT(entry.st_mode))
+
+
+def _name_identity(directory_fd, name):
+    try:
+        entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return _entry_identity(entry)
+
+
+def _unlink_if_identity_matches(directory_fd, name, expected_identity):
+    if (
+        expected_identity is None
+        or _name_identity(directory_fd, name) != expected_identity
+    ):
+        return False
+    os.unlink(name, dir_fd=directory_fd)
+    return True
+
+
 def _publish_fact_no_clobber(directory_fd, fact):
     data = _canonical_json(fact)
     filename = fact["record_id"] + ".json"
@@ -61,6 +84,10 @@ def _publish_fact_no_clobber(directory_fd, fact):
     )
     file_fd = None
     owns_temporary = False
+    temporary_identity = None
+    invalid_final_identity = None
+    final_link_matches_temporary = False
+    final_link_persisted = False
     try:
         file_fd = os.open(
             temporary_name,
@@ -69,10 +96,23 @@ def _publish_fact_no_clobber(directory_fd, fact):
             dir_fd=directory_fd,
         )
         owns_temporary = True
+        opened_entry = os.fstat(file_fd)
+        if not stat.S_ISREG(opened_entry.st_mode):
+            raise ValidationError("temporary fact must be a regular file")
+        temporary_identity = _entry_identity(opened_entry)
         _write_all(file_fd, data)
         os.fsync(file_fd)
+        written_entry = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(written_entry.st_mode)
+            or _entry_identity(written_entry) != temporary_identity
+        ):
+            raise ValidationError("temporary fact identity changed while writing")
         os.close(file_fd)
         file_fd = None
+
+        if _name_identity(directory_fd, temporary_name) != temporary_identity:
+            raise ValidationError("temporary fact identity changed before publish")
 
         try:
             os.link(
@@ -82,6 +122,13 @@ def _publish_fact_no_clobber(directory_fd, fact):
                 dst_dir_fd=directory_fd,
                 follow_symlinks=False,
             )
+            final_identity = _name_identity(directory_fd, filename)
+            if final_identity != temporary_identity:
+                invalid_final_identity = final_identity
+                raise ValidationError("published fact identity changed during link")
+            final_link_matches_temporary = True
+            os.fsync(directory_fd)
+            final_link_persisted = True
             published = True
         except FileExistsError:
             existing_fd = _open_existing_regular(directory_fd, filename)
@@ -96,7 +143,12 @@ def _publish_fact_no_clobber(directory_fd, fact):
                 )
             published = False
 
-        os.unlink(temporary_name, dir_fd=directory_fd)
+        if not _unlink_if_identity_matches(
+            directory_fd,
+            temporary_name,
+            temporary_identity,
+        ):
+            raise ValidationError("temporary fact identity changed before cleanup")
         owns_temporary = False
         os.fsync(directory_fd)
         return published
@@ -106,11 +158,31 @@ def _publish_fact_no_clobber(directory_fd, fact):
                 os.close(file_fd)
             except OSError:
                 pass
-        if owns_temporary:
+        directory_changed = False
+        if invalid_final_identity is not None:
             try:
-                os.unlink(temporary_name, dir_fd=directory_fd)
+                directory_changed = _unlink_if_identity_matches(
+                    directory_fd,
+                    filename,
+                    invalid_final_identity,
+                )
             except OSError:
                 pass
+        if owns_temporary and (
+            not final_link_matches_temporary or final_link_persisted
+        ):
+            try:
+                directory_changed = (
+                    _unlink_if_identity_matches(
+                        directory_fd,
+                        temporary_name,
+                        temporary_identity,
+                    )
+                    or directory_changed
+                )
+            except OSError:
+                pass
+        if directory_changed:
             try:
                 os.fsync(directory_fd)
             except OSError:

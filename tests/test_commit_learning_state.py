@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -170,6 +171,113 @@ class CommitLearningStateTest(unittest.TestCase):
                     if (fact_directory / name).exists()
                 ],
             )
+
+    def test_successful_publish_persists_link_before_temporary_cleanup(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        with tempfile.TemporaryDirectory() as tmp:
+            fact_directory = Path(tmp)
+            directory_fd = os.open(
+                fact_directory,
+                os.O_RDONLY | os.O_DIRECTORY,
+            )
+            events = []
+            real_fsync = os.fsync
+            real_link = os.link
+            real_unlink = os.unlink
+
+            def tracked_fsync(file_fd):
+                result = real_fsync(file_fd)
+                if file_fd == directory_fd:
+                    events.append("fsync-directory")
+                return result
+
+            def tracked_link(source, destination, *args, **kwargs):
+                result = real_link(source, destination, *args, **kwargs)
+                events.append("link-final")
+                return result
+
+            def tracked_unlink(path, *args, **kwargs):
+                result = real_unlink(path, *args, **kwargs)
+                if kwargs.get("dir_fd") == directory_fd:
+                    events.append("unlink-temporary")
+                return result
+
+            try:
+                with mock.patch.object(
+                    commit_learning_state.os,
+                    "fsync",
+                    side_effect=tracked_fsync,
+                ), mock.patch.object(
+                    commit_learning_state.os,
+                    "link",
+                    side_effect=tracked_link,
+                ), mock.patch.object(
+                    commit_learning_state.os,
+                    "unlink",
+                    side_effect=tracked_unlink,
+                ):
+                    published = commit_learning_state._publish_fact_no_clobber(
+                        directory_fd,
+                        fact,
+                    )
+            finally:
+                os.close(directory_fd)
+
+            self.assertTrue(published)
+            self.assertEqual(
+                [
+                    "link-final",
+                    "fsync-directory",
+                    "unlink-temporary",
+                    "fsync-directory",
+                ],
+                events,
+            )
+            self.assertEqual(
+                commit_learning_state._canonical_json(fact),
+                (fact_directory / "record-session-001.json").read_bytes(),
+            )
+
+    def test_replaced_temporary_name_is_neither_published_nor_removed(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        replacement = b"fictional replacement inode\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            fact_directory = Path(tmp)
+            directory_fd = os.open(
+                fact_directory,
+                os.O_RDONLY | os.O_DIRECTORY,
+            )
+            real_link = os.link
+            replaced_names = []
+
+            def replace_temporary_then_link(source, destination, *args, **kwargs):
+                temporary_path = fact_directory / source
+                temporary_path.unlink()
+                temporary_path.write_bytes(replacement)
+                replaced_names.append(source)
+                return real_link(source, destination, *args, **kwargs)
+
+            try:
+                with mock.patch.object(
+                    commit_learning_state.os,
+                    "link",
+                    side_effect=replace_temporary_then_link,
+                ):
+                    with self.assertRaisesRegex(ValidationError, "identity"):
+                        commit_learning_state._publish_fact_no_clobber(
+                            directory_fd,
+                            fact,
+                        )
+            finally:
+                os.close(directory_fd)
+
+            self.assertEqual(1, len(replaced_names))
+            self.assertFalse(
+                (fact_directory / "record-session-001.json").exists()
+            )
+            replacement_path = fact_directory / replaced_names[0]
+            self.assertTrue(replacement_path.exists())
+            self.assertEqual(replacement, replacement_path.read_bytes())
 
     def test_cross_type_record_id_conflict_preserves_workspace(self):
         session = session_fact(observations=[knowledge_observation()])

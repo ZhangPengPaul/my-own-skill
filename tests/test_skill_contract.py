@@ -238,11 +238,22 @@ class SkillContractTest(unittest.TestCase):
 
     def test_reinforcement_and_delayed_retest_are_evidence_gated(self):
         section = extract_section(self.content, "当场强化与延迟复测")
+        positive_transfer = (
+            "还要在新的表示或情境中独立完成并解释方法，才支持 `transferable`"
+        )
         for phrase in (
             "最小前置内容", "同类订正", "改变数字、条件、材料或表示方式",
             "延迟复测", "无提示", "没有学生表现证据", "不改变掌握状态",
+            "先达到 `stable` 后",
+            positive_transfer,
+            "不能把达到 `stable` 之前的当场变式追溯为迁移证据",
         ):
             self.assertIn(phrase, section)
+        opposite = "即使之后在新情境中独立完成并解释方法，也不支持 `transferable`"
+        self.assertNotIn(opposite, section)
+        mutated = section + opposite
+        with self.assertRaises(AssertionError):
+            self.assertNotIn(opposite, mutated)
 
     def test_temporary_session_has_zero_writes(self):
         section = extract_section(self.content, "定位学生工作区")

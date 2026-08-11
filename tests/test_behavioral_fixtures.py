@@ -28,6 +28,7 @@ EXPECTED_IDS = {
     "unreadable-input",
     "no-evidence-no-mastery",
 }
+PHASE_ONE_SUBJECTS = ("语文", "数学", "英语", "政治", "历史", "地理")
 SUBJECT_LOOP_CASES = {
     "语文": "chinese-text-evidence",
     "数学": "reinforcement-and-delayed-retest",
@@ -199,13 +200,14 @@ class BehavioralFixtureTest(unittest.TestCase):
     def test_every_phase_one_subject_appears_in_a_prompt(self):
         cases = json.loads((BEHAVIORAL / "cases.json").read_text(encoding="utf-8"))
         prompts = "\n".join(case["prompt"] for case in cases)
-        for subject in ("语文", "数学", "英语", "政治", "历史", "地理"):
+        for subject in PHASE_ONE_SUBJECTS:
             with self.subTest(subject=subject):
                 self.assertIn(subject, prompts)
 
     def test_each_subject_has_complete_evidence_loop_case(self):
         cases = json.loads((BEHAVIORAL / "cases.json").read_text(encoding="utf-8"))
         by_id = {case["id"]: case for case in cases}
+        self.assertEqual(set(PHASE_ONE_SUBJECTS), set(SUBJECT_LOOP_CASES))
         for subject, case_id in SUBJECT_LOOP_CASES.items():
             with self.subTest(subject=subject, case_id=case_id):
                 case = by_id[case_id]
@@ -214,6 +216,11 @@ class BehavioralFixtureTest(unittest.TestCase):
                 output_contract = "\n".join(case["must"])
                 for marker in LOOP_OUTPUT_MARKERS:
                     self.assertIn(marker, output_contract)
+                self.assertIn("本证据链最高只支持 stable", output_contract)
+                self.assertIn(
+                    "凭 stable 前的当场变式判为 transferable",
+                    "\n".join(case["must_not"]),
+                )
 
     def test_single_error_case_preserves_existing_stable_state(self):
         cases = json.loads((BEHAVIORAL / "cases.json").read_text(encoding="utf-8"))

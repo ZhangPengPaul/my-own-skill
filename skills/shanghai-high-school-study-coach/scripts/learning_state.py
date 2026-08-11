@@ -122,7 +122,7 @@ def _require_id(value, field):
     require(isinstance(value, str) and ID.fullmatch(value), f"{field} is invalid")
 
 
-def _parse_timestamp(value, field, allow_none=False):
+def parse_timestamp(value, field, allow_none=False):
     if allow_none and value is None:
         return None
     require(isinstance(value, str) and value.strip(), f"{field} is required")
@@ -144,7 +144,7 @@ def _parse_timestamp(value, field, allow_none=False):
 
 
 def _require_timestamp(value, field, allow_none=False):
-    _parse_timestamp(value, field, allow_none=allow_none)
+    parse_timestamp(value, field, allow_none=allow_none)
 
 
 def _require_optional_string(value, field):
@@ -668,7 +668,7 @@ def reconcile_state(
             if fact["status"] == "completed"
         ),
         key=lambda fact: (
-            _parse_timestamp(fact["completed_at"], "completed_at"),
+            parse_timestamp(fact["completed_at"], "completed_at"),
             fact["session_id"],
             fact["record_id"],
         ),

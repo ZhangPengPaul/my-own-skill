@@ -155,28 +155,57 @@ class SkillContractTest(unittest.TestCase):
 
     def test_priority_protocol_matches_confirmed_spec(self):
         section = extract_section(self.content, "优先级和学习计划")
-        for phrase in (
-            "教师明确要求",
-            "学生当前目标",
-            "覆盖自动排序",
-            "前置依赖影响",
-            "证据强度",
-            "重复出现频率",
-            "当前教材与教师进度",
-            "到期复测",
-            "可用时间",
-            "1 个主要内容薄弱",
-            "1 个必要前置内容",
-            "1 个重复出现的执行模式",
-            "以及到期复测",
-        ):
-            self.assertIn(phrase, section)
-        self.assertLess(section.index("教师明确要求"), section.index("自动排序"))
-        self.assertLess(section.index("学生当前目标"), section.index("自动排序"))
-        self.assertIn(
-            "匹配学科、目标类型和目标ID的真实证据",
-            re.sub(r"\s+", "", section),
+        self.assert_priority_protocol(section)
+
+    def test_priority_protocol_rejects_opposite_mutations(self):
+        section = re.sub(
+            r"\s+",
+            "",
+            extract_section(self.content, "优先级和学习计划"),
         )
+        mutations = (
+            (
+                "教师明确要求或学生当前目标中的任一项，都优先于并覆盖自动排序。",
+                "教师明确要求或学生当前目标中的任一项，都不覆盖自动排序。",
+            ),
+            (
+                "自动排序必须综合比较以下六项：",
+                "自动排序不考虑以下六项：",
+            ),
+            (
+                "每个计划最多包含：",
+                "每个计划不限量包含：",
+            ),
+            (
+                "完成计划必须引用匹配学科、目标类型和目标ID的真实证据。",
+                "完成计划不必引用匹配学科、目标类型和目标ID的真实证据。",
+            ),
+        )
+        for affirmative, opposite in mutations:
+            with self.subTest(opposite=opposite):
+                mutated = section.replace(affirmative, opposite)
+                self.assertNotEqual(section, mutated)
+                with self.assertRaises(AssertionError):
+                    self.assert_priority_protocol(mutated)
+
+    def assert_priority_protocol(self, section):
+        normalized = re.sub(r"\s+", "", section)
+        for sentence in (
+            "教师明确要求或学生当前目标中的任一项，都优先于并覆盖自动排序。",
+            "自动排序必须综合比较以下六项：前置依赖影响、证据强度、重复出现频率、"
+            "当前教材与教师进度、到期复测和可用时间。",
+            "每个计划最多包含：1个主要内容薄弱、1个必要前置内容、"
+            "1个重复出现的执行模式，以及到期复测。",
+            "完成计划必须引用匹配学科、目标类型和目标ID的真实证据。",
+        ):
+            self.assertIn(sentence, normalized)
+        for opposite in (
+            "不覆盖自动排序",
+            "不考虑以下六项",
+            "不限量包含",
+            "不必引用匹配学科、目标类型和目标ID的真实证据",
+        ):
+            self.assertNotIn(opposite, normalized)
 
     def test_portable_commands_are_documented(self):
         self.assertIn(

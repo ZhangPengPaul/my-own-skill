@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sys
 
-from learning_state import SUBJECTS, _parse_timestamp
+from learning_state import SUBJECTS, parse_timestamp
 from validate_student_data import ValidationError, validate_workspace
 
 
@@ -53,7 +53,7 @@ def _active_pending_plan_items(plan_items):
         key=lambda item: (
             item["priority"],
             item["due_at"] is None,
-            _parse_timestamp(item["due_at"], "due_at")
+            parse_timestamp(item["due_at"], "due_at")
             if item["due_at"] is not None
             else None,
             item["item_id"],
@@ -76,7 +76,7 @@ def _render_subject(lines, subject_name, subject, now):
     for target_id, target in sorted(units.items()):
         due = target["next_review_at"]
         due_label = ""
-        if due is not None and _parse_timestamp(due, "next_review_at") <= now:
+        if due is not None and parse_timestamp(due, "next_review_at") <= now:
             due_label = "；到期复测"
         evidence_ids = ", ".join(
             _escape_markdown_line(evidence_id)
@@ -117,7 +117,7 @@ def render(workspace, now=None):
     workspace = Path(workspace)
     snapshot = validate_workspace(workspace)
     state = snapshot.state
-    current = _parse_timestamp(
+    current = parse_timestamp(
         now or datetime.now(timezone.utc).isoformat(),
         "now",
     )

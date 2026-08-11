@@ -199,7 +199,7 @@ class SummarizeProgressTest(unittest.TestCase):
         self.assertLess(output.index("绝对时间较早"), output.index("绝对时间较晚"))
         self.assertLess(output.index("绝对时间较晚"), output.index("未设日期"))
 
-    def test_uses_shared_timestamp_parser_for_now_reviews_and_plan_due_dates(self):
+    def test_zulu_review_is_due_at_equivalent_offset_now(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = self.initialize_workspace(Path(tmp))
             self.commit_session(
@@ -212,31 +212,22 @@ class SummarizeProgressTest(unittest.TestCase):
                     )
                 ],
             )
-            commit_fact(
+            output = summarize_progress.render(
                 workspace,
-                plan_fact(due_at="2026-08-08T00:30:00+01:00"),
-                now=NOW,
+                now="2026-08-06T13:00:00+01:00",
             )
-            shared_parser = summarize_progress._parse_timestamp
 
-            with mock.patch.object(
-                summarize_progress,
-                "_parse_timestamp",
-                wraps=shared_parser,
-            ) as parser:
+        self.assertIn("到期复测", output)
+
+    def test_rejects_naive_now(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+
+            with self.assertRaisesRegex(summarize_progress.ValidationError, "now"):
                 summarize_progress.render(
                     workspace,
-                    now="2026-08-06T13:00:00+01:00",
+                    now="2026-08-06T12:00:00",
                 )
-
-        self.assertEqual(
-            [
-                mock.call("2026-08-06T13:00:00+01:00", "now"),
-                mock.call("2026-08-06T12:00:00Z", "next_review_at"),
-                mock.call("2026-08-08T00:30:00+01:00", "due_at"),
-            ],
-            parser.call_args_list,
-        )
 
     def test_renders_the_snapshot_returned_by_validation(self):
         with tempfile.TemporaryDirectory() as tmp:

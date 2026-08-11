@@ -10,6 +10,7 @@ sys.path.insert(0, str(SCRIPTS))
 from learning_state import (  # noqa: E402
     SUBJECT_MODULES,
     ValidationError,
+    parse_timestamp,
     reconcile_state,
     validate_fact,
     validate_plan_fact,
@@ -89,6 +90,18 @@ class FactSchemaTest(unittest.TestCase):
         validate_session_fact(session)
         validate_plan_fact(plan_fact(due_at="2026-08-13T10:00:00Z"))
         reconcile_state("student-a", [session], [], now="2026-08-06T12:00:00Z")
+
+    def test_public_timestamp_parser_treats_z_and_offset_as_same_instant(self):
+        self.assertEqual(
+            parse_timestamp(
+                "2026-08-06T12:00:00Z",
+                "timestamp",
+            ),
+            parse_timestamp(
+                "2026-08-06T13:00:00+01:00",
+                "timestamp",
+            ),
+        )
 
     def test_timestamps_reject_date_only_and_naive_values(self):
         for value in ("2026-08-06", "2026-08-06T10:00:00"):

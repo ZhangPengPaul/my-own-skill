@@ -3,6 +3,7 @@
 
 import argparse
 from dataclasses import dataclass
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -199,8 +200,8 @@ def open_workspace_descriptor(workspace):
         raise ValidationError(f"workspace cannot be opened: {error}") from error
 
 
-def read_workspace_snapshot_fd(root_fd, require_consistent_state=True):
-    """Read all required children relative to a held workspace descriptor."""
+def _read_workspace_snapshot_fd_unlocked(root_fd, require_consistent_state=True):
+    """Read required children while the caller holds the workspace lock."""
     opened_files = []
     opened_directories = []
     try:
@@ -233,6 +234,22 @@ def read_workspace_snapshot_fd(root_fd, require_consistent_state=True):
             os.close(file_fd)
         for _, directory_fd in opened_directories:
             os.close(directory_fd)
+
+
+def read_workspace_snapshot_fd(root_fd, require_consistent_state=True):
+    """Read one snapshot while holding the workspace's shared lock."""
+    lock_fd = _open_existing_regular(root_fd, ".workspace.lock")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+        try:
+            return _read_workspace_snapshot_fd_unlocked(
+                root_fd,
+                require_consistent_state,
+            )
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
 
 
 def read_workspace_snapshot(workspace, require_consistent_state=True):

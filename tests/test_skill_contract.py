@@ -82,8 +82,10 @@ class SkillContractTest(unittest.TestCase):
         mutations = (
             ("内容薄弱与执行模式分开记录。", "内容薄弱与执行模式合并记录。"),
             (
-                "一次计算、审题或表达失误只记录执行模式，不降低内容状态；",
-                "一次计算、审题或表达失误把`stable`降为`suspected_gap`；",
+                "普通初次作答中的一次计算、审题或表达失误只记录执行模式，"
+                "不降低内容状态。",
+                "普通初次作答中的一次计算、审题或表达失误把`stable`降为"
+                "`suspected_gap`。",
             ),
         )
         for affirmative, opposite in mutations:
@@ -155,7 +157,10 @@ class SkillContractTest(unittest.TestCase):
             "可以同时记录`observed_once`",
             "不得升级为`confirmed_gap`",
             "已有`provisionally_mastered`、`stable`或`transferable`时",
-            "一次计算、审题或表达失误只记录执行模式，不降低内容状态",
+            "普通初次作答中的一次计算、审题或表达失误只记录执行模式，"
+            "不降低内容状态",
+            "无提示变式、延迟复测或迁移任务是掌握检查",
+            "其失败属于诊断证据，可以把内容状态降为`confirmed_gap`",
             "只有诊断证据表明不理解相关内容时，才允许内容状态降级",
             "符合上述内容诊断门槛的新失败才可以导致降级",
         ):

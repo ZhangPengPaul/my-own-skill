@@ -28,6 +28,24 @@ EXPECTED_IDS = {
     "unreadable-input",
     "no-evidence-no-mastery",
 }
+SUBJECT_LOOP_CASES = {
+    "语文": "chinese-text-evidence",
+    "数学": "reinforcement-and-delayed-retest",
+    "英语": "english-writing",
+    "政治": "politics-material-link",
+    "历史": "history-source-limits",
+    "地理": "geography-fact-versus-inference",
+}
+LOOP_OUTPUT_MARKERS = (
+    "内容问题",
+    "执行模式",
+    "suspected_gap",
+    "confirmed_gap",
+    "strengthening",
+    "provisionally_mastered",
+    "stable",
+    "讲解不作为掌握证据",
+)
 MATH_LINES = (
     "Fictional mathematics review",
     "1. Solve x^2 - 5x + 6 = 0.",
@@ -184,6 +202,27 @@ class BehavioralFixtureTest(unittest.TestCase):
         for subject in ("语文", "数学", "英语", "政治", "历史", "地理"):
             with self.subTest(subject=subject):
                 self.assertIn(subject, prompts)
+
+    def test_each_subject_has_complete_evidence_loop_case(self):
+        cases = json.loads((BEHAVIORAL / "cases.json").read_text(encoding="utf-8"))
+        by_id = {case["id"]: case for case in cases}
+        for subject, case_id in SUBJECT_LOOP_CASES.items():
+            with self.subTest(subject=subject, case_id=case_id):
+                case = by_id[case_id]
+                self.assertIn(subject, case["prompt"])
+                self.assertIn("学生表现链", case["prompt"])
+                output_contract = "\n".join(case["must"])
+                for marker in LOOP_OUTPUT_MARKERS:
+                    self.assertIn(marker, output_contract)
+
+    def test_single_error_case_preserves_existing_stable_state(self):
+        cases = json.loads((BEHAVIORAL / "cases.json").read_text(encoding="utf-8"))
+        case = next(
+            case for case in cases if case["id"] == "single-error-needs-confirmation"
+        )
+        contract = "\n".join([case["prompt"], *case["must"]])
+        self.assertIn("此前为 stable", contract)
+        self.assertIn("保留已有 stable", contract)
 
     def test_direct_answer_case_requires_complete_explanation(self):
         cases = json.loads((BEHAVIORAL / "cases.json").read_text(encoding="utf-8"))

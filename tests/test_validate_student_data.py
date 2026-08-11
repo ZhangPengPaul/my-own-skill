@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -14,6 +15,8 @@ VALIDATOR_SCRIPT = SCRIPTS / "validate_student_data.py"
 sys.path.insert(0, str(SCRIPTS))
 
 import validate_student_data  # noqa: E402
+import commit_learning_state  # noqa: E402
+from commit_learning_state import commit_fact  # noqa: E402
 from validate_student_data import (  # noqa: E402
     ValidationError,
     WorkspaceSnapshot,
@@ -74,6 +77,67 @@ class ValidateStudentDataTest(unittest.TestCase):
         self.assertEqual(expected, snapshot.state)
         self.assertEqual((session,), snapshot.sessions)
         self.assertEqual((plan,), snapshot.plan_items)
+
+    def test_validation_waits_for_concurrent_commit_snapshot(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace)
+            replace_entered = threading.Event()
+            allow_replace = threading.Event()
+            validation_finished = threading.Event()
+            writer_errors = []
+            validation_results = []
+            real_replace = commit_learning_state._replace_state_atomically
+
+            def blocked_replace(root_fd, state):
+                replace_entered.set()
+                if not allow_replace.wait(timeout=5):
+                    raise RuntimeError("timed out waiting to replace state")
+                return real_replace(root_fd, state)
+
+            def write_fact():
+                try:
+                    commit_fact(workspace, fact)
+                except BaseException as error:
+                    writer_errors.append(error)
+
+            def validate_snapshot():
+                try:
+                    validation_results.append(validate_workspace(workspace))
+                except BaseException as error:
+                    validation_results.append(error)
+                finally:
+                    validation_finished.set()
+
+            writer = threading.Thread(target=write_fact)
+            validator = threading.Thread(target=validate_snapshot)
+            with mock.patch.object(
+                commit_learning_state,
+                "_replace_state_atomically",
+                side_effect=blocked_replace,
+            ):
+                writer.start()
+                self.assertTrue(replace_entered.wait(timeout=5))
+                validator.start()
+                finished_before_state_replace = validation_finished.wait(timeout=0.2)
+                allow_replace.set()
+                writer.join(timeout=5)
+                validator.join(timeout=5)
+
+            self.assertFalse(writer.is_alive())
+            self.assertFalse(validator.is_alive())
+            self.assertFalse(
+                finished_before_state_replace,
+                "validation read a snapshot while the writer held the workspace lock",
+            )
+            self.assertEqual([], writer_errors)
+            self.assertEqual(1, len(validation_results))
+            self.assertIsInstance(validation_results[0], WorkspaceSnapshot)
+            self.assertEqual(
+                1,
+                validation_results[0].state["process"]["recorded_sessions"],
+            )
 
     def test_rejects_fact_filename_that_does_not_match_record_id(self):
         session = session_fact(observations=[knowledge_observation()])

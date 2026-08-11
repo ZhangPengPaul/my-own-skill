@@ -553,6 +553,14 @@ def _content_status(observation, current_status, prior_evidence):
     if observation["outcome"] == "incorrect":
         if current_status == "confirmed_gap":
             return current_status
+        if current_status in (
+            "provisionally_mastered",
+            "stable",
+            "transferable",
+        ):
+            if observation["evidence_type"] == "initial_attempt":
+                return current_status
+            return "confirmed_gap"
         if (
             any(
                 evidence["outcome"] == "incorrect"
@@ -560,12 +568,6 @@ def _content_status(observation, current_status, prior_evidence):
             )
             and observation["evidence_type"]
             in ("diagnostic", "correction", "variant")
-        ):
-            return "confirmed_gap"
-        if (
-            current_status
-            in ("provisionally_mastered", "stable", "transferable")
-            and observation["evidence_type"] == "diagnostic"
         ):
             return "confirmed_gap"
         return "suspected_gap"

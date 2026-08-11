@@ -17,8 +17,8 @@ from learning_state import ValidationError, reconcile_state, validate_fact
 from validate_student_data import (
     _open_existing_directory,
     _open_existing_regular,
+    _read_workspace_snapshot_fd_unlocked,
     open_workspace_descriptor,
-    read_workspace_snapshot_fd,
     validate_state,
 )
 
@@ -294,7 +294,7 @@ def commit_fact(workspace, fact, now=None):
     try:
         lock_fd = _open_existing_regular(root_fd, ".workspace.lock", writable=True)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        snapshot = read_workspace_snapshot_fd(
+        snapshot = _read_workspace_snapshot_fd_unlocked(
             root_fd,
             require_consistent_state=False,
         )
@@ -322,7 +322,7 @@ def commit_fact(workspace, fact, now=None):
         fact_directory_fd = _open_existing_directory(root_fd, directory_name)
         published = _publish_fact_no_clobber(fact_directory_fd, fact)
 
-        snapshot = read_workspace_snapshot_fd(
+        snapshot = _read_workspace_snapshot_fd_unlocked(
             root_fd, require_consistent_state=False
         )
         candidate = reconcile_state(
@@ -335,7 +335,10 @@ def commit_fact(workspace, fact, now=None):
         validate_state(candidate, snapshot.sessions, snapshot.plan_items)
         if candidate != snapshot.state:
             _replace_state_atomically(root_fd, candidate)
-        read_workspace_snapshot_fd(root_fd, require_consistent_state=True)
+        _read_workspace_snapshot_fd_unlocked(
+            root_fd,
+            require_consistent_state=True,
+        )
         return published
     finally:
         if fact_directory_fd is not None:

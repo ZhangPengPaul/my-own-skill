@@ -238,6 +238,62 @@ class CommitLearningStateTest(unittest.TestCase):
                 (fact_directory / "record-session-001.json").read_bytes(),
             )
 
+    def test_post_link_directory_fsync_failure_is_recoverable(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            fact_directory = workspace / "sessions"
+            directory_entry = fact_directory.stat()
+            directory_identity = (
+                directory_entry.st_dev,
+                directory_entry.st_ino,
+            )
+            old_state = (workspace / "state.json").read_bytes()
+            real_fsync = os.fsync
+            failed_directory_fsync = False
+
+            def fail_first_fact_directory_fsync(file_fd):
+                nonlocal failed_directory_fsync
+                entry = os.fstat(file_fd)
+                if (
+                    not failed_directory_fsync
+                    and (entry.st_dev, entry.st_ino) == directory_identity
+                ):
+                    failed_directory_fsync = True
+                    raise OSError("fictional post-link directory fsync failure")
+                return real_fsync(file_fd)
+
+            with mock.patch.object(
+                commit_learning_state.os,
+                "fsync",
+                side_effect=fail_first_fact_directory_fsync,
+            ):
+                with self.assertRaisesRegex(OSError, "post-link directory fsync"):
+                    commit_fact(workspace, fact, now=NOW)
+
+            self.assertTrue(failed_directory_fsync)
+            final_path = fact_directory / "record-session-001.json"
+            self.assertEqual(
+                commit_learning_state._canonical_json(fact),
+                final_path.read_bytes(),
+            )
+            self.assertEqual(
+                ["record-session-001.json"],
+                sorted(path.name for path in fact_directory.iterdir()),
+            )
+            self.assertEqual(old_state, (workspace / "state.json").read_bytes())
+
+            published = commit_fact(workspace, fact, now=LATER)
+            snapshot = validate_workspace(workspace)
+
+            self.assertFalse(published)
+            self.assertEqual(1, snapshot.state["process"]["recorded_sessions"])
+            self.assertEqual(LATER, snapshot.state["updated_at"])
+            self.assertEqual(
+                ["record-session-001.json"],
+                sorted(path.name for path in fact_directory.iterdir()),
+            )
+
     def test_replaced_temporary_name_is_neither_published_nor_removed(self):
         fact = session_fact(observations=[knowledge_observation()])
         replacement = b"fictional replacement inode\n"

@@ -86,8 +86,6 @@ def _publish_fact_no_clobber(directory_fd, fact):
     owns_temporary = False
     temporary_identity = None
     invalid_final_identity = None
-    final_link_matches_temporary = False
-    final_link_persisted = False
     try:
         file_fd = os.open(
             temporary_name,
@@ -126,9 +124,7 @@ def _publish_fact_no_clobber(directory_fd, fact):
             if final_identity != temporary_identity:
                 invalid_final_identity = final_identity
                 raise ValidationError("published fact identity changed during link")
-            final_link_matches_temporary = True
             os.fsync(directory_fd)
-            final_link_persisted = True
             published = True
         except FileExistsError:
             existing_fd = _open_existing_regular(directory_fd, filename)
@@ -158,31 +154,28 @@ def _publish_fact_no_clobber(directory_fd, fact):
                 os.close(file_fd)
             except OSError:
                 pass
-        directory_changed = False
+        should_fsync_directory = (
+            invalid_final_identity is not None or owns_temporary
+        )
         if invalid_final_identity is not None:
             try:
-                directory_changed = _unlink_if_identity_matches(
+                _unlink_if_identity_matches(
                     directory_fd,
                     filename,
                     invalid_final_identity,
                 )
             except OSError:
                 pass
-        if owns_temporary and (
-            not final_link_matches_temporary or final_link_persisted
-        ):
+        if owns_temporary:
             try:
-                directory_changed = (
-                    _unlink_if_identity_matches(
-                        directory_fd,
-                        temporary_name,
-                        temporary_identity,
-                    )
-                    or directory_changed
+                _unlink_if_identity_matches(
+                    directory_fd,
+                    temporary_name,
+                    temporary_identity,
                 )
             except OSError:
                 pass
-        if directory_changed:
+        if should_fsync_directory:
             try:
                 os.fsync(directory_fd)
             except OSError:

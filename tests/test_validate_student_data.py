@@ -75,6 +75,17 @@ class ValidateStudentDataTest(unittest.TestCase):
         self.assertEqual((session,), snapshot.sessions)
         self.assertEqual((plan,), snapshot.plan_items)
 
+    def test_rejects_fact_filename_that_does_not_match_record_id(self):
+        session = session_fact(observations=[knowledge_observation()])
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace, sessions=[session])
+            original_path = workspace / "sessions/record-session-001.json"
+            original_path.rename(workspace / "sessions/alias.json")
+
+            with self.assertRaisesRegex(ValidationError, "filename|record_id"):
+                validate_workspace(workspace)
+
     def test_validate_state_accepts_matching_facts(self):
         session = session_fact(observations=[knowledge_observation()])
         state = state_from_facts(sessions=[session])

@@ -2,6 +2,7 @@
 """Commit one immutable learning fact and reconcile derived state."""
 
 import argparse
+import ctypes
 from datetime import datetime, timezone
 import errno
 import fcntl
@@ -68,6 +69,55 @@ def _unlink_if_identity_matches(directory_fd, name, expected_identity):
     return True
 
 
+def _publish_held_file_no_clobber(source_fd, directory_fd, filename):
+    if sys.platform != "darwin":
+        raise ValidationError(
+            "atomic held-file publish is unavailable on this platform"
+        )
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        clone_file = libc.fclonefileat
+    except (AttributeError, OSError) as error:
+        raise ValidationError(
+            "atomic held-file publish is unavailable on this platform"
+        ) from error
+
+    clone_file.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint32,
+    ]
+    clone_file.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = clone_file(
+        source_fd,
+        directory_fd,
+        os.fsencode(filename),
+        0,
+    )
+    if result == 0:
+        return
+
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(
+            error_number,
+            os.strerror(error_number),
+            filename,
+        )
+    unavailable = {errno.ENOSYS, errno.EINVAL}
+    for name in ("ENOTSUP", "EOPNOTSUPP"):
+        value = getattr(errno, name, None)
+        if value is not None:
+            unavailable.add(value)
+    if error_number in unavailable:
+        raise ValidationError(
+            "atomic held-file publish is unavailable on this platform"
+        )
+    raise OSError(error_number, os.strerror(error_number), filename)
+
+
 def _publish_fact_no_clobber(directory_fd, fact):
     data = _canonical_json(fact)
     filename = fact["record_id"] + ".json"
@@ -83,9 +133,11 @@ def _publish_fact_no_clobber(directory_fd, fact):
         | getattr(os, "O_CLOEXEC", 0)
     )
     file_fd = None
+    source_fd = None
+    published_fd = None
+    published_identity = None
     owns_temporary = False
     temporary_identity = None
-    invalid_final_identity = None
     try:
         file_fd = os.open(
             temporary_name,
@@ -109,22 +161,16 @@ def _publish_fact_no_clobber(directory_fd, fact):
         os.close(file_fd)
         file_fd = None
 
-        if _name_identity(directory_fd, temporary_name) != temporary_identity:
+        source_fd = _open_existing_regular(directory_fd, temporary_name)
+        if _entry_identity(os.fstat(source_fd)) != temporary_identity:
             raise ValidationError("temporary fact identity changed before publish")
 
         try:
-            os.link(
-                temporary_name,
+            _publish_held_file_no_clobber(
+                source_fd,
+                directory_fd,
                 filename,
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
-                follow_symlinks=False,
             )
-            final_identity = _name_identity(directory_fd, filename)
-            if final_identity != temporary_identity:
-                invalid_final_identity = final_identity
-                raise ValidationError("published fact identity changed during link")
-            os.fsync(directory_fd)
             published = True
         except FileExistsError:
             existing_fd = _open_existing_regular(directory_fd, filename)
@@ -139,6 +185,23 @@ def _publish_fact_no_clobber(directory_fd, fact):
                 )
             published = False
 
+        if published:
+            published_fd = _open_existing_regular(directory_fd, filename)
+            published_identity = _entry_identity(os.fstat(published_fd))
+            published_data = _read_all(published_fd)
+            if published_data != data:
+                raise ValidationError(
+                    "published fact content or identity changed"
+                )
+
+        os.close(source_fd)
+        source_fd = None
+        if published:
+            os.fsync(directory_fd)
+            if _name_identity(directory_fd, filename) != published_identity:
+                raise ValidationError("published fact identity changed")
+            os.close(published_fd)
+            published_fd = None
         if not _unlink_if_identity_matches(
             directory_fd,
             temporary_name,
@@ -154,16 +217,14 @@ def _publish_fact_no_clobber(directory_fd, fact):
                 os.close(file_fd)
             except OSError:
                 pass
-        should_fsync_directory = (
-            invalid_final_identity is not None or owns_temporary
-        )
-        if invalid_final_identity is not None:
+        if source_fd is not None:
             try:
-                _unlink_if_identity_matches(
-                    directory_fd,
-                    filename,
-                    invalid_final_identity,
-                )
+                os.close(source_fd)
+            except OSError:
+                pass
+        if published_fd is not None:
+            try:
+                os.close(published_fd)
             except OSError:
                 pass
         if owns_temporary:
@@ -175,7 +236,7 @@ def _publish_fact_no_clobber(directory_fd, fact):
                 )
             except OSError:
                 pass
-        if should_fsync_directory:
+        if owns_temporary:
             try:
                 os.fsync(directory_fd)
             except OSError:
@@ -233,21 +294,27 @@ def commit_fact(workspace, fact, now=None):
             root_fd,
             require_consistent_state=False,
         )
+        existing_by_record_id = {}
+        for existing in snapshot.sessions + snapshot.plan_items:
+            record_id = existing["record_id"]
+            if record_id in existing_by_record_id:
+                raise ValidationError("duplicate record_id: %s" % record_id)
+            existing_by_record_id[record_id] = existing
+
+        existing = existing_by_record_id.get(fact["record_id"])
+        if existing is not None:
+            if existing["record_type"] != fact["record_type"]:
+                raise ValidationError(
+                    "duplicate record_id: %s" % fact["record_id"]
+                )
+            if _canonical_json(existing) != _canonical_json(fact):
+                raise ValidationError(
+                    "record_id conflicts with an existing immutable fact: %s"
+                    % fact["record_id"]
+                )
         directory_name = (
             "sessions" if fact["record_type"] == "session" else "plan-items"
         )
-        other_facts = (
-            snapshot.plan_items
-            if fact["record_type"] == "session"
-            else snapshot.sessions
-        )
-        if any(
-            existing["record_id"] == fact["record_id"]
-            for existing in other_facts
-        ):
-            raise ValidationError(
-                "duplicate record_id: %s" % fact["record_id"]
-            )
         fact_directory_fd = _open_existing_directory(root_fd, directory_name)
         published = _publish_fact_no_clobber(fact_directory_fd, fact)
 

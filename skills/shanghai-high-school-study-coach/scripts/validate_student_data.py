@@ -137,6 +137,10 @@ def _read_fact_directory(directory_fd, label, validator, record_type):
             f"record_type is invalid for {label}/{name}",
         )
         validator(fact)
+        require(
+            name == fact["record_id"] + ".json",
+            f"fact filename must match record_id in {label}: {name}",
+        )
         facts.append(fact)
     return tuple(facts)
 

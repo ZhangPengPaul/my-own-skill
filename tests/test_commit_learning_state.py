@@ -128,9 +128,15 @@ class CommitLearningStateTest(unittest.TestCase):
             original_bytes = fact_path.read_bytes()
             state_bytes = (workspace / "state.json").read_bytes()
 
-            with self.assertRaisesRegex(ValidationError, "record_id|conflict"):
-                commit_fact(workspace, conflicting, now=LATER)
+            with mock.patch.object(
+                commit_learning_state,
+                "_publish_fact_no_clobber",
+                wraps=commit_learning_state._publish_fact_no_clobber,
+            ) as publish:
+                with self.assertRaisesRegex(ValidationError, "record_id|conflict"):
+                    commit_fact(workspace, conflicting, now=LATER)
 
+            publish.assert_not_called()
             self.assertEqual(original_bytes, fact_path.read_bytes())
             self.assertEqual(state_bytes, (workspace / "state.json").read_bytes())
 
@@ -143,6 +149,9 @@ class CommitLearningStateTest(unittest.TestCase):
             temporary_names = []
 
             def interrupt_fact_write(file_fd, data):
+                written = os.write(file_fd, data[: len(data) // 2])
+                self.assertGreater(written, 0)
+                self.assertLess(written, len(data))
                 self.assertFalse(final_path.exists())
                 names = [path.name for path in fact_directory.iterdir()]
                 self.assertEqual(1, len(names))
@@ -182,18 +191,19 @@ class CommitLearningStateTest(unittest.TestCase):
             )
             events = []
             real_fsync = os.fsync
-            real_link = os.link
             real_unlink = os.unlink
+            final_path = fact_directory / "record-session-001.json"
 
             def tracked_fsync(file_fd):
+                if (
+                    file_fd == directory_fd
+                    and final_path.exists()
+                    and "publish-final" not in events
+                ):
+                    events.append("publish-final")
                 result = real_fsync(file_fd)
                 if file_fd == directory_fd:
                     events.append("fsync-directory")
-                return result
-
-            def tracked_link(source, destination, *args, **kwargs):
-                result = real_link(source, destination, *args, **kwargs)
-                events.append("link-final")
                 return result
 
             def tracked_unlink(path, *args, **kwargs):
@@ -209,10 +219,6 @@ class CommitLearningStateTest(unittest.TestCase):
                     side_effect=tracked_fsync,
                 ), mock.patch.object(
                     commit_learning_state.os,
-                    "link",
-                    side_effect=tracked_link,
-                ), mock.patch.object(
-                    commit_learning_state.os,
                     "unlink",
                     side_effect=tracked_unlink,
                 ):
@@ -226,7 +232,7 @@ class CommitLearningStateTest(unittest.TestCase):
             self.assertTrue(published)
             self.assertEqual(
                 [
-                    "link-final",
+                    "publish-final",
                     "fsync-directory",
                     "unlink-temporary",
                     "fsync-directory",
@@ -303,21 +309,23 @@ class CommitLearningStateTest(unittest.TestCase):
                 fact_directory,
                 os.O_RDONLY | os.O_DIRECTORY,
             )
-            real_link = os.link
+            real_write_all = commit_learning_state._write_all
             replaced_names = []
 
-            def replace_temporary_then_link(source, destination, *args, **kwargs):
-                temporary_path = fact_directory / source
+            def write_then_replace_temporary(file_fd, data):
+                real_write_all(file_fd, data)
+                names = [path.name for path in fact_directory.iterdir()]
+                self.assertEqual(1, len(names))
+                temporary_path = fact_directory / names[0]
                 temporary_path.unlink()
                 temporary_path.write_bytes(replacement)
-                replaced_names.append(source)
-                return real_link(source, destination, *args, **kwargs)
+                replaced_names.extend(names)
 
             try:
                 with mock.patch.object(
-                    commit_learning_state.os,
-                    "link",
-                    side_effect=replace_temporary_then_link,
+                    commit_learning_state,
+                    "_write_all",
+                    side_effect=write_then_replace_temporary,
                 ):
                     with self.assertRaisesRegex(ValidationError, "identity"):
                         commit_learning_state._publish_fact_no_clobber(
@@ -332,6 +340,144 @@ class CommitLearningStateTest(unittest.TestCase):
                 (fact_directory / "record-session-001.json").exists()
             )
             replacement_path = fact_directory / replaced_names[0]
+            self.assertTrue(replacement_path.exists())
+            self.assertEqual(replacement, replacement_path.read_bytes())
+
+    def test_publish_fails_closed_without_held_fd_primitive(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        with tempfile.TemporaryDirectory() as tmp:
+            fact_directory = Path(tmp)
+            directory_fd = os.open(
+                fact_directory,
+                os.O_RDONLY | os.O_DIRECTORY,
+            )
+            try:
+                with mock.patch.object(
+                    commit_learning_state.sys,
+                    "platform",
+                    "fictional-os",
+                ):
+                    with self.assertRaisesRegex(
+                        ValidationError,
+                        "held-file|unavailable|platform",
+                    ):
+                        commit_learning_state._publish_fact_no_clobber(
+                            directory_fd,
+                            fact,
+                        )
+            finally:
+                os.close(directory_fd)
+
+            self.assertEqual([], list(fact_directory.iterdir()))
+
+    def test_replaced_final_after_publish_is_never_unlinked(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        replacement_fact = session_fact(
+            student_attempt="fictional replacement evidence",
+            observations=[knowledge_observation()],
+        )
+        replacement = commit_learning_state._canonical_json(replacement_fact)
+        with tempfile.TemporaryDirectory() as tmp:
+            fact_directory = Path(tmp)
+            directory_fd = os.open(
+                fact_directory,
+                os.O_RDONLY | os.O_DIRECTORY,
+            )
+            final_name = "record-session-001.json"
+            final_path = fact_directory / final_name
+            directory_entry = fact_directory.stat()
+            directory_identity = (
+                directory_entry.st_dev,
+                directory_entry.st_ino,
+            )
+            real_fsync = os.fsync
+            replaced_final = False
+
+            def replace_final_before_directory_fsync(file_fd):
+                nonlocal replaced_final
+                entry = os.fstat(file_fd)
+                if (
+                    not replaced_final
+                    and (entry.st_dev, entry.st_ino) == directory_identity
+                    and final_path.exists()
+                ):
+                    final_path.unlink()
+                    final_path.write_bytes(replacement)
+                    replaced_final = True
+                return real_fsync(file_fd)
+
+            try:
+                with mock.patch.object(
+                    commit_learning_state.os,
+                    "fsync",
+                    side_effect=replace_final_before_directory_fsync,
+                ):
+                    with self.assertRaisesRegex(
+                        ValidationError,
+                        "published|identity|content",
+                    ):
+                        commit_learning_state._publish_fact_no_clobber(
+                            directory_fd,
+                            fact,
+                        )
+            finally:
+                os.close(directory_fd)
+
+            self.assertTrue(replaced_final)
+            self.assertTrue(final_path.exists())
+            self.assertEqual(replacement, final_path.read_bytes())
+
+    def test_replaced_source_name_never_publishes_replacement_content(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        replacement = b"not canonical fact content\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            fact_directory = Path(tmp)
+            directory_fd = os.open(
+                fact_directory,
+                os.O_RDONLY | os.O_DIRECTORY,
+            )
+            final_name = "record-session-001.json"
+            final_path = fact_directory / final_name
+            real_stat = os.stat
+            replaced_source_name = None
+            observed_final_contents = []
+
+            def replace_source_after_stat(path, *args, **kwargs):
+                nonlocal replaced_source_name
+                entry = real_stat(path, *args, **kwargs)
+                if (
+                    replaced_source_name is None
+                    and kwargs.get("dir_fd") == directory_fd
+                    and isinstance(path, str)
+                    and path.startswith(".record-session-001-")
+                    and path.endswith(".tmp")
+                ):
+                    temporary_path = fact_directory / path
+                    temporary_path.unlink()
+                    temporary_path.write_bytes(replacement)
+                    replaced_source_name = path
+                elif path == final_name:
+                    observed_final_contents.append(final_path.read_bytes())
+                return entry
+
+            try:
+                with mock.patch.object(
+                    commit_learning_state.os,
+                    "stat",
+                    side_effect=replace_source_after_stat,
+                ):
+                    with self.assertRaisesRegex(ValidationError, "identity"):
+                        commit_learning_state._publish_fact_no_clobber(
+                            directory_fd,
+                            fact,
+                        )
+            finally:
+                os.close(directory_fd)
+
+            self.assertIsNotNone(replaced_source_name)
+            self.assertNotIn(replacement, observed_final_contents)
+            self.assertFalse(final_path.exists())
+            replacement_path = fact_directory / replaced_source_name
             self.assertTrue(replacement_path.exists())
             self.assertEqual(replacement, replacement_path.read_bytes())
 
@@ -359,6 +505,60 @@ class CommitLearningStateTest(unittest.TestCase):
                 (workspace / "state.json").read_bytes(),
             )
             validate_workspace(workspace)
+
+    def test_existing_cross_type_duplicate_is_rejected_before_publish(self):
+        session = session_fact(observations=[knowledge_observation()])
+        duplicate_plan = plan_fact(record_id=session["record_id"])
+        incoming = session_fact(
+            record_id="record-session-002",
+            session_id="session-002",
+            completed_at="2026-08-06T10:10:00+00:00",
+            observations=[knowledge_observation(evidence_id="evidence-002")],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            commit_fact(workspace, session, now=NOW)
+            duplicate_path = (
+                workspace
+                / "plan-items"
+                / "record-session-001.json"
+            )
+            duplicate_path.write_bytes(
+                commit_learning_state._canonical_json(duplicate_plan)
+            )
+            state_before = (workspace / "state.json").read_bytes()
+            incoming_path = workspace / "sessions/record-session-002.json"
+
+            with self.assertRaisesRegex(ValidationError, "duplicate record_id"):
+                commit_fact(workspace, incoming, now=LATER)
+
+            self.assertFalse(incoming_path.exists())
+            self.assertEqual(
+                state_before,
+                (workspace / "state.json").read_bytes(),
+            )
+
+    def test_alias_fact_name_is_rejected_before_publish(self):
+        existing = session_fact(observations=[knowledge_observation()])
+        incoming = plan_fact(record_id="record-plan-002", item_id="item-002")
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            commit_fact(workspace, existing, now=NOW)
+            original_path = workspace / "sessions/record-session-001.json"
+            alias_path = workspace / "sessions/alias.json"
+            original_path.rename(alias_path)
+            state_before = (workspace / "state.json").read_bytes()
+            incoming_path = workspace / "plan-items/record-plan-002.json"
+
+            with self.assertRaisesRegex(ValidationError, "filename|record_id"):
+                commit_fact(workspace, incoming, now=LATER)
+
+            self.assertTrue(alias_path.exists())
+            self.assertFalse(incoming_path.exists())
+            self.assertEqual(
+                state_before,
+                (workspace / "state.json").read_bytes(),
+            )
 
     def test_state_replace_failure_is_recoverable(self):
         fact = session_fact(observations=[knowledge_observation()])

@@ -75,9 +75,152 @@ class SkillContractTest(unittest.TestCase):
 
     def test_single_error_is_suspected_before_diagnostic_confirmation(self):
         section = extract_section(self.content, "识别薄弱点")
-        self.assertLess(section.index("suspected_gap"), section.index("confirmed_gap"))
-        for phrase in ("单次错误", "追问或最小诊断", "内容薄弱", "执行模式"):
-            self.assertIn(phrase, section)
+        self.assert_single_error_protocol(section)
+
+    def test_single_error_protocol_rejects_opposite_mutations(self):
+        section = re.sub(r"\s+", "", extract_section(self.content, "识别薄弱点"))
+        mutations = (
+            ("内容薄弱与执行模式分开记录。", "内容薄弱与执行模式合并记录。"),
+            (
+                "一次计算、审题或表达失误只记录执行模式，不降低内容状态；",
+                "一次计算、审题或表达失误把`stable`降为`suspected_gap`；",
+            ),
+        )
+        for affirmative, opposite in mutations:
+            with self.subTest(opposite=opposite):
+                mutated = section.replace(affirmative, opposite)
+                self.assertNotEqual(section, mutated)
+                with self.assertRaises(AssertionError):
+                    self.assert_single_error_protocol(mutated)
+
+        for contradiction in (
+            "内容薄弱与执行模式合并记录。",
+            "无需诊断证据即可降低内容状态。",
+        ):
+            with self.subTest(contradiction=contradiction):
+                with self.assertRaises(AssertionError):
+                    self.assert_single_error_protocol(section + contradiction)
+
+        for source, destinations in self.single_error_forbidden_downgrades().items():
+            for destination in destinations:
+                contradiction = (
+                    f"一次计算失误可以把`{source}`降为`{destination}`。"
+                )
+                with self.subTest(source=source, destination=destination):
+                    with self.assertRaises(AssertionError):
+                        self.assert_single_error_protocol(section + contradiction)
+
+        self.assert_single_error_protocol(
+            section + "一次审题失误不能把`transferable`降为`confirmed_gap`。"
+        )
+        self.assert_single_error_protocol(
+            section + "一次审题失误可以不把`transferable`降为`confirmed_gap`。"
+        )
+        with self.assertRaises(AssertionError):
+            self.assert_single_error_protocol(
+                section
+                + "一次计算失误不代表内容缺口，但可以把`stable`降为"
+                "`provisionally_mastered`。"
+            )
+        with self.assertRaises(AssertionError):
+            self.assert_single_error_protocol(
+                section
+                + "一次计算失误后，`stable`可以降为`provisionally_mastered`。"
+            )
+        with self.assertRaises(AssertionError):
+            self.assert_single_error_protocol(
+                section
+                + "一次计算失误不能把`stable`降为`confirmed_gap`，但可以把"
+                "`stable`降为`provisionally_mastered`。"
+            )
+        with self.assertRaises(AssertionError):
+            self.assert_single_error_protocol(
+                section
+                + "一次计算失误不能把`stable`降为`confirmed_gap`；但可以把"
+                "`stable`降为`provisionally_mastered`。"
+            )
+        self.assert_single_error_protocol(
+            section
+            + "一次表达失误可以把`stable`保持为原状态，不降为"
+            "`provisionally_mastered`。"
+        )
+
+    def assert_single_error_protocol(self, section):
+        normalized = re.sub(r"\s+", "", section)
+        self.assertLess(normalized.index("suspected_gap"), normalized.index("confirmed_gap"))
+        for clause in (
+            "内容薄弱与执行模式分开记录。",
+            "没有更高既有状态时",
+            "单次错误涉及的内容状态只标记为`suspected_gap`（待确认线索）",
+            "可以同时记录`observed_once`",
+            "不得升级为`confirmed_gap`",
+            "已有`provisionally_mastered`、`stable`或`transferable`时",
+            "一次计算、审题或表达失误只记录执行模式，不降低内容状态",
+            "只有诊断证据表明不理解相关内容时，才允许内容状态降级",
+            "符合上述内容诊断门槛的新失败才可以导致降级",
+        ):
+            self.assertIn(clause, normalized)
+        for opposite in (
+            "内容薄弱与执行模式合并记录",
+            "无需诊断证据即可降低内容状态",
+            "内容状态按证据更新，允许新失败导致降级",
+        ):
+            self.assertNotIn(opposite, normalized)
+        for sentence in normalized.split("。"):
+            if not re.search(r"一次(?:计算|审题|表达)(?:、审题或表达)?失误", sentence):
+                continue
+            for clause in re.split(r"[，,；;]", sentence):
+                for source, destinations in self.single_error_forbidden_downgrades().items():
+                    destination_pattern = "|".join(
+                        re.escape(f"`{destination}`") for destination in destinations
+                    )
+                    source_pattern = re.escape(f"`{source}`")
+                    downgrade_target = (
+                        r"[^。；，,]*降[^。；，,]*(?:"
+                        + destination_pattern
+                        + r")"
+                    )
+                    affirmative = re.search(
+                        r"(?:可以把|会把|应当把|将|把)[^。；，,]*"
+                        + source_pattern
+                        + downgrade_target,
+                        clause,
+                    ) or re.search(
+                        source_pattern
+                        + r"[^。；，,]*(?:可以|会|将|应当)"
+                        + downgrade_target,
+                        clause,
+                    )
+                    protected = re.search(
+                        r"(?:不可以把|不能把|不会把|不得把|不应当把|可以不把|"
+                        r"不将|不能将|不会将|不得将|不应当将|可以不将)"
+                        r"[^。；，,]*"
+                        + source_pattern
+                        + downgrade_target,
+                        clause,
+                    ) or re.search(
+                        source_pattern
+                        + r"[^。；，,]*(?:不会|不应当|不得|不能|不)"
+                        + downgrade_target,
+                        clause,
+                    )
+                    self.assertFalse(affirmative and not protected)
+
+    @staticmethod
+    def single_error_forbidden_downgrades():
+        return {
+            "provisionally_mastered": (
+                "unassessed", "suspected_gap", "confirmed_gap", "strengthening",
+            ),
+            "stable": (
+                "unassessed", "suspected_gap", "confirmed_gap", "strengthening",
+                "provisionally_mastered",
+            ),
+            "transferable": (
+                "unassessed", "suspected_gap", "confirmed_gap", "strengthening",
+                "provisionally_mastered", "stable",
+            ),
+        }
 
     def test_defines_content_and_pattern_states(self):
         section = extract_section(self.content, "识别薄弱点")

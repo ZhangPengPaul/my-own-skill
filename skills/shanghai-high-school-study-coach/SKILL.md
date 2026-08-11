@@ -72,10 +72,15 @@ description: 面向上海高中语文、数学、英语、政治、历史、地�
 ## 识别薄弱点
 
 内容薄弱与执行模式分开记录。一次计算、审题或表达失误可以先记为执行模式，不能
-自动推断学生不理解相关内容。单次错误或学生自述只支持 `suspected_gap`；通过追问或最小诊断
+自动推断学生不理解相关内容。学生自述也只支持 `suspected_gap`；通过追问或最小诊断
 再次暴露相同内容问题，才支持 `confirmed_gap`。
 
-内容状态按证据更新，允许新失败导致降级：
+没有更高既有状态时，单次错误涉及的内容状态只标记为 `suspected_gap`（待确认线索）；
+可以同时记录 `observed_once`，但不得升级为 `confirmed_gap`。
+已有 `provisionally_mastered`、`stable` 或 `transferable` 时，一次计算、审题或表达失误
+只记录执行模式，不降低内容状态；只有诊断证据表明不理解相关内容时，才允许内容状态降级。
+
+内容状态按证据更新；符合上述内容诊断门槛的新失败才可以导致降级：
 
 `unassessed -> suspected_gap -> confirmed_gap -> strengthening -> provisionally_mastered -> stable -> transferable`
 

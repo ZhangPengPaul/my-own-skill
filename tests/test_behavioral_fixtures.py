@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BEHAVIORAL = ROOT / "tests/behavioral"
 FIXTURES = BEHAVIORAL / "fixtures"
 GENERATOR_PATH = BEHAVIORAL / "generate_fixtures.py"
+FORWARD_SUMMARY = BEHAVIORAL / "forward-test-summary.md"
 FIXTURE_NAMES = ("math-exam.pdf", "english-essay.svg")
 EXPECTED_IDS = {
     "math-guided-diagnosis",
@@ -203,6 +204,12 @@ class BehavioralFixtureTest(unittest.TestCase):
         for subject in PHASE_ONE_SUBJECTS:
             with self.subTest(subject=subject):
                 self.assertIn(subject, prompts)
+
+    def test_forward_summary_lists_each_case_id_exactly_once(self):
+        summary = FORWARD_SUMMARY.read_text(encoding="utf-8")
+        for case_id in EXPECTED_IDS:
+            with self.subTest(case_id=case_id):
+                self.assertEqual(1, summary.count(case_id))
 
     def test_each_subject_has_complete_evidence_loop_case(self):
         cases = json.loads((BEHAVIORAL / "cases.json").read_text(encoding="utf-8"))

@@ -13,6 +13,8 @@ from learning_state import (  # noqa: E402
     parse_timestamp,
     reconcile_state,
     validate_fact,
+    validate_observation_fact,
+    aggregate_observations,
     validate_plan_fact,
     validate_session_fact,
 )
@@ -25,6 +27,29 @@ from tests.workspace_fixtures import (  # noqa: E402
 
 
 NOW = "2026-08-06T12:00:00+00:00"
+
+
+def interaction_observation(**overrides):
+    value = {
+        "schema_version": 1,
+        "record_type": "interaction_observation",
+        "record_id": "observation-001",
+        "interaction_id": "interaction-001",
+        "occurred_at": "2026-08-06T10:00:00+00:00",
+        "subject": "mathematics",
+        "module_id": "geometry",
+        "target_kind": "knowledge_unit",
+        "target_id": "mathematics.geometry.dihedral-angle",
+        "target_name": "二面角的平面角",
+        "signal_kind": "execution_pattern",
+        "signal": "反复漏掉限制条件",
+        "evidence_strength": "weak",
+        "interaction_kind": "photo_question",
+        "student_action": "提交题目并请求解法",
+        "uncertainty": "尚未完成独立变式",
+    }
+    value.update(overrides)
+    return value
 EXPECTED_SUBJECT_MODULES = {
     "chinese": {
         "language-and-accumulation",
@@ -71,6 +96,68 @@ EXPECTED_SUBJECT_MODULES = {
 
 
 class FactSchemaTest(unittest.TestCase):
+    def test_valid_interaction_observation_fact(self):
+        validate_observation_fact(interaction_observation())
+
+    def test_interaction_observation_rejects_raw_material_fields(self):
+        fact = interaction_observation()
+        fact["student_response"] = "原始回答"
+        with self.assertRaisesRegex(ValidationError, "fields are invalid"):
+            validate_observation_fact(fact)
+
+    def test_interaction_observation_rejects_derived_confirmed_strength(self):
+        fact = interaction_observation(evidence_strength="confirmed")
+        with self.assertRaisesRegex(ValidationError, "evidence_strength"):
+            validate_observation_fact(fact)
+
+    def test_interaction_observation_duplicate_interaction_is_excluded(self):
+        first = interaction_observation()
+        second = interaction_observation(record_id="observation-002")
+        self.assertEqual((), aggregate_observations([first, second]))
+
+    def test_interaction_observation_target_mismatch_is_excluded(self):
+        first = interaction_observation()
+        second = interaction_observation(
+            record_id="observation-002", target_id="mathematics.geometry.other"
+        )
+        summaries = aggregate_observations([first, second])
+        self.assertEqual((), summaries)
+
+    def test_pending_normalization_observations_are_excluded(self):
+        first = interaction_observation(target_id="pending-normalization")
+        second = interaction_observation(
+            record_id="observation-002",
+            interaction_id="interaction-002",
+            target_id="pending-normalization",
+        )
+        self.assertEqual((), aggregate_observations([first, second]))
+
+    def test_two_interactions_produce_deterministic_pending_validation(self):
+        first = interaction_observation()
+        second = interaction_observation(
+            record_id="observation-002",
+            interaction_id="interaction-002",
+            occurred_at="2026-08-07T10:00:00+00:00",
+        )
+        expected = (
+            {
+                "subject": "mathematics",
+                "module_id": "geometry",
+                "target_kind": "knowledge_unit",
+                "target_id": "mathematics.geometry.dihedral-angle",
+                "signal_kind": "execution_pattern",
+                "status": "pending-validation",
+                "observation_count": 2,
+                "interaction_ids": ["interaction-001", "interaction-002"],
+                "latest_occurred_at": "2026-08-07T10:00:00+00:00",
+                "signal": "反复漏掉限制条件",
+                "uncertainties": ["尚未完成独立变式"],
+            },
+        )
+        self.assertEqual(expected, aggregate_observations([second, first]))
+
+    def test_validate_fact_accepts_interaction_observation(self):
+        validate_fact(interaction_observation())
     def test_runtime_subject_modules_match_reference_contract(self):
         self.assertEqual(EXPECTED_SUBJECT_MODULES, SUBJECT_MODULES)
 

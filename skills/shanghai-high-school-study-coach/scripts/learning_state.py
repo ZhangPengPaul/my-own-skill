@@ -105,6 +105,14 @@ HINT_LEVELS = (
     "next_step",
     "worked_example",
 )
+OBSERVATION_STRENGTHS = ("weak", "repeated")
+INTERACTION_KINDS = (
+    "photo_question",
+    "knowledge_question",
+    "vocabulary_question",
+    "follow_up",
+    "other",
+)
 
 ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,95}$")
 
@@ -288,6 +296,161 @@ def validate_observation(observation, subject):
             and observation["student_explanation"].strip(),
             "correct transfer evidence requires no hint and a student explanation",
         )
+
+
+def validate_observation_fact(fact):
+    """Validate a lightweight, non-evidence interaction observation fact."""
+    require(isinstance(fact, dict), "observation fact must be an object")
+    _require_exact_keys(
+        fact,
+        {
+            "schema_version",
+            "record_type",
+            "record_id",
+            "interaction_id",
+            "occurred_at",
+            "subject",
+            "module_id",
+            "target_kind",
+            "target_id",
+            "target_name",
+            "signal_kind",
+            "signal",
+            "evidence_strength",
+            "interaction_kind",
+            "student_action",
+            "uncertainty",
+        },
+        "observation fact",
+    )
+    require(
+        fact.get("schema_version") == 1
+        and type(fact.get("schema_version")) is int,
+        "schema_version must be the integer 1",
+    )
+    require(
+        fact.get("record_type") == "interaction_observation",
+        "record_type must be interaction_observation",
+    )
+    _require_id(fact.get("record_id"), "record_id")
+    _require_id(fact.get("interaction_id"), "interaction_id")
+    _require_timestamp(fact.get("occurred_at"), "occurred_at")
+    subject = fact.get("subject")
+    require(subject in SUBJECTS, "subject is invalid")
+    _require_id(fact.get("module_id"), "module_id")
+    require(
+        fact["module_id"] in SUBJECT_MODULES[subject],
+        "module_id must belong to observation subject",
+    )
+    require(
+        fact.get("target_kind") in ("knowledge_unit", "pattern"),
+        "target_kind is invalid",
+    )
+    target_id = fact.get("target_id")
+    require(
+        isinstance(target_id, str)
+        and (target_id == "pending-normalization" or target_id.startswith(subject + "."))
+        and len(target_id) <= 256,
+        "target_id must match observation subject or be pending-normalization",
+    )
+    require(
+        isinstance(fact.get("target_name"), str) and fact["target_name"].strip(),
+        "target_name is required",
+    )
+    require(
+        isinstance(fact.get("signal_kind"), str) and fact["signal_kind"].strip(),
+        "signal_kind is required",
+    )
+    require(
+        isinstance(fact.get("signal"), str)
+        and fact["signal"].strip()
+        and len(fact["signal"]) <= 500,
+        "signal is required and must be at most 500 characters",
+    )
+    require(
+        fact.get("evidence_strength") in OBSERVATION_STRENGTHS,
+        "evidence_strength is invalid",
+    )
+    require(
+        fact.get("interaction_kind") in INTERACTION_KINDS,
+        "interaction_kind is invalid",
+    )
+    require(
+        isinstance(fact.get("student_action"), str)
+        and fact["student_action"].strip()
+        and len(fact["student_action"]) <= 500,
+        "student_action is required and must be at most 500 characters",
+    )
+    _require_optional_string(fact.get("uncertainty"), "uncertainty")
+
+
+def aggregate_observations(observations):
+    """Return deterministic pending-validation summaries for repeated signals."""
+    groups = {}
+    for observation in observations:
+        validate_observation_fact(observation)
+        if observation["target_id"] == "pending-normalization":
+            continue
+        key = (
+            observation["subject"],
+            observation["module_id"],
+            observation["target_kind"],
+            observation["target_id"],
+            observation["signal_kind"],
+        )
+        groups.setdefault(key, []).append(observation)
+
+    summaries = []
+    for key, group in groups.items():
+        by_interaction = {}
+        for observation in group:
+            interaction_id = observation["interaction_id"]
+            existing = by_interaction.get(interaction_id)
+            if existing is None or (
+                parse_timestamp(observation["occurred_at"], "occurred_at"),
+                observation["record_id"],
+            ) > (
+                parse_timestamp(existing["occurred_at"], "occurred_at"),
+                existing["record_id"],
+            ):
+                by_interaction[interaction_id] = observation
+        unique = sorted(
+            by_interaction.values(),
+            key=lambda item: (parse_timestamp(item["occurred_at"], "occurred_at"), item["interaction_id"], item["record_id"]),
+        )
+        if len(unique) < 2:
+            continue
+        latest = unique[-1]
+        uncertainties = sorted(
+            {item["uncertainty"] for item in unique if item["uncertainty"]}
+        )
+        summaries.append(
+            {
+                "subject": key[0],
+                "module_id": key[1],
+                "target_kind": key[2],
+                "target_id": key[3],
+                "signal_kind": key[4],
+                "status": "pending-validation",
+                "observation_count": len(unique),
+                "interaction_ids": sorted(item["interaction_id"] for item in unique),
+                "latest_occurred_at": latest["occurred_at"],
+                "signal": latest["signal"],
+                "uncertainties": uncertainties,
+            }
+        )
+    return tuple(
+        sorted(
+            summaries,
+            key=lambda item: (
+                item["subject"],
+                item["module_id"],
+                item["target_kind"],
+                item["target_id"],
+                item["signal_kind"],
+            ),
+        )
+    )
 
 
 def validate_session_fact(fact):
@@ -487,6 +650,8 @@ def validate_fact(fact):
         validate_session_fact(fact)
     elif fact.get("record_type") == "plan_item":
         validate_plan_fact(fact)
+    elif fact.get("record_type") == "interaction_observation":
+        validate_observation_fact(fact)
     else:
         raise ValidationError("record_type is invalid")
 

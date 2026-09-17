@@ -1,4 +1,7 @@
 /.worktrees/
 /student-workspaces/
+**/student-workspaces/
+**/private-workspace-roots/
+/skills/*-workspace/
 __pycache__/
 *.py[cod]

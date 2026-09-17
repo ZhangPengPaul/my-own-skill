@@ -15,9 +15,12 @@ COMMIT = SCRIPTS / "commit_learning_state.py"
 sys.path.insert(0, str(SCRIPTS))
 
 import commit_learning_state  # noqa: E402
+import validate_student_data  # noqa: E402
 from commit_learning_state import commit_fact  # noqa: E402
 from validate_student_data import ValidationError, validate_workspace  # noqa: E402
 from tests.workspace_fixtures import (  # noqa: E402
+    create_workspace,
+    interaction_observation,
     knowledge_observation,
     plan_fact,
     session_fact,
@@ -49,6 +52,8 @@ class CommitLearningStateTest(unittest.TestCase):
                 str(workspace),
                 "--fact-file",
                 str(fact_file),
+                "--student-id",
+                "student-a",
             ],
             capture_output=True,
             text=True,
@@ -71,6 +76,129 @@ class CommitLearningStateTest(unittest.TestCase):
                 "mathematics.geometry.dihedral-angle"
             ]
             self.assertEqual("suspected_gap", unit["status"])
+
+    def test_interaction_observation_commit_publishes_without_state_change(self):
+        fact = interaction_observation()
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            state_before = (workspace / "state.json").read_bytes()
+            published = commit_fact(workspace, fact, now=NOW)
+            self.assertTrue(published)
+            self.assertTrue((workspace / "observations" / "observation-001.json").is_file())
+            self.assertEqual(state_before, (workspace / "state.json").read_bytes())
+            validate_workspace(workspace)
+
+    def test_commit_keeps_using_opened_workspace_when_path_is_retargeted_after_migration(self):
+        fact = interaction_observation(
+            record_id="observation-new",
+            interaction_id="interaction-new",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            requested = root / "student-a"
+            moved_requested = root / "student-a-moved"
+            replacement = root / "student-b"
+            create_workspace(requested)
+            create_workspace(replacement)
+            real_cleanup = validate_student_data._cleanup_lock_descriptor
+            retargeted = False
+
+            def cleanup_then_retarget(lock_fd):
+                nonlocal retargeted
+                real_cleanup(lock_fd)
+                if not retargeted:
+                    requested.rename(moved_requested)
+                    try:
+                        requested.symlink_to(replacement, target_is_directory=True)
+                    except (NotImplementedError, OSError) as error:
+                        self.skipTest(f"symlinks are unavailable: {error}")
+                    retargeted = True
+
+            with mock.patch.object(
+                validate_student_data,
+                "_cleanup_lock_descriptor",
+                side_effect=cleanup_then_retarget,
+            ):
+                self.assertTrue(commit_fact(requested, fact, now=NOW))
+
+            self.assertTrue(retargeted)
+            self.assertTrue(
+                (moved_requested / "observations" / "observation-new.json").is_file()
+            )
+            self.assertFalse(
+                (replacement / "observations" / "observation-new.json").exists()
+            )
+
+    def test_interaction_observation_commit_rejects_stale_state(self):
+        session = session_fact(observations=[knowledge_observation()])
+        fact = interaction_observation()
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            self.assertTrue(commit_fact(workspace, session, now=NOW))
+            state_path = workspace / "state.json"
+            stale_state = json.loads(state_path.read_text(encoding="utf-8"))
+            stale_state["process"]["recorded_sessions"] = 99
+            state_path.write_text(
+                json.dumps(stale_state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            state_before = state_path.read_bytes()
+            with self.assertRaisesRegex(ValidationError, "derived|reconcile"):
+                commit_fact(workspace, fact, now=NOW)
+            self.assertEqual(state_before, state_path.read_bytes())
+            self.assertFalse((workspace / "observations" / "observation-001.json").exists())
+
+    def test_identical_observation_retry_is_noop(self):
+        fact = interaction_observation()
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            self.assertTrue(commit_fact(workspace, fact, now=NOW))
+            self.assertFalse(commit_fact(workspace, fact, now=LATER))
+            self.assertEqual(1, len(list((workspace / "observations").glob("*.json"))))
+
+    def test_observation_record_id_conflicts_across_fact_types(self):
+        session = session_fact(record_id="shared-record")
+        observation = interaction_observation(record_id="shared-record")
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            self.assertTrue(commit_fact(workspace, session, now=NOW))
+            with self.assertRaisesRegex(ValidationError, "duplicate record_id"):
+                commit_fact(workspace, observation, now=LATER)
+            self.assertFalse((workspace / "observations" / "shared-record.json").exists())
+            validate_workspace(workspace)
+
+    def test_observation_publish_failure_does_not_change_state(self):
+        fact = interaction_observation()
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            state_before = (workspace / "state.json").read_bytes()
+            with mock.patch.object(
+                commit_learning_state,
+                "_publish_fact_no_clobber",
+                side_effect=OSError("fictional observation publish failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "observation publish failure"):
+                    commit_fact(workspace, fact, now=NOW)
+            self.assertEqual(state_before, (workspace / "state.json").read_bytes())
+            self.assertFalse((workspace / "observations" / "observation-001.json").exists())
+
+    def test_session_commit_migrates_legacy_workspace(self):
+        fact = session_fact(observations=[knowledge_observation()])
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            (workspace / "observations").rmdir()
+            commit_fact(workspace, fact, now=NOW)
+            self.assertTrue((workspace / "observations").is_dir())
+            self.assertTrue((workspace / "sessions" / (fact["record_id"] + ".json")).is_file())
+
+    def test_plan_commit_migrates_legacy_workspace(self):
+        fact = plan_fact()
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            (workspace / "observations").rmdir()
+            commit_fact(workspace, fact, now=NOW)
+            self.assertTrue((workspace / "observations").is_dir())
+            self.assertTrue((workspace / "plan-items" / (fact["record_id"] + ".json")).is_file())
 
     def test_implicit_commit_time_is_computed_once_and_reused(self):
         fact = session_fact(observations=[knowledge_observation()])
@@ -963,6 +1091,8 @@ class CommitLearningStateTest(unittest.TestCase):
                         str(workspace),
                         "--fact-file",
                         str(path),
+                        "--student-id",
+                        "student-a",
                     ],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -982,6 +1112,53 @@ class CommitLearningStateTest(unittest.TestCase):
                 {"record-session-001.json", "record-session-002.json"},
                 {path.name for path in (workspace / "sessions").iterdir()},
             )
+
+    def test_two_concurrent_observation_commits_preserve_both_facts_and_state(self):
+        first = interaction_observation()
+        second = interaction_observation(
+            record_id="observation-002",
+            interaction_id="interaction-002",
+            occurred_at="2026-08-06T10:01:00+00:00",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self.initialize_workspace(Path(tmp))
+            state_before = (workspace / "state.json").read_bytes()
+            inputs = []
+            for fact in (first, second):
+                path = Path(tmp) / (fact["record_id"] + "-input.json")
+                path.write_text(json.dumps(fact, ensure_ascii=False), encoding="utf-8")
+                inputs.append(path)
+
+            processes = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(COMMIT),
+                        str(workspace),
+                        "--fact-file",
+                        str(path),
+                        "--student-id",
+                        "student-a",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for path in inputs
+            ]
+            results = []
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=10)
+                results.append((process.returncode, stdout, stderr))
+
+            self.assertEqual([0, 0], sorted(result[0] for result in results), results)
+            snapshot = validate_workspace(workspace)
+            self.assertEqual(2, len(snapshot.observations))
+            self.assertEqual(
+                {"observation-001.json", "observation-002.json"},
+                {path.name for path in (workspace / "observations").iterdir()},
+            )
+            self.assertEqual(state_before, (workspace / "state.json").read_bytes())
 
     def test_fact_directory_close_failure_does_not_skip_other_cleanup(self):
         fact = session_fact(observations=[knowledge_observation()])

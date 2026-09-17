@@ -16,6 +16,7 @@ from learning_state import (
     ValidationError,
     reconcile_state,
     require,
+    validate_observation_fact,
     validate_plan_fact,
     validate_session_fact,
 )
@@ -23,7 +24,7 @@ from learning_state import (
 
 STUDENT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 REQUIRED_REGULAR_FILES = ("profile.md", "state.json", ".workspace.lock")
-REQUIRED_DIRECTORIES = ("sessions", "plan-items", "summaries", "materials")
+REQUIRED_DIRECTORIES = ("sessions", "plan-items", "summaries", "materials", "observations")
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,7 @@ class WorkspaceSnapshot:
     state: dict
     sessions: tuple
     plan_items: tuple
+    observations: tuple = ()
 
 
 def _directory_flags():
@@ -185,6 +187,28 @@ def _cleanup_lock_descriptor(lock_fd):
         raise first_error
 
 
+def _cleanup_workspace_descriptors(root_fd, lock_fd, child_fds=()):
+    """Attempt all cleanup operations and propagate the first cleanup failure."""
+    first_error = None
+    try:
+        _close_all(child_fds)
+    except BaseException as error:
+        first_error = error
+    if lock_fd is not None:
+        try:
+            _cleanup_lock_descriptor(lock_fd)
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    try:
+        os.close(root_fd)
+    except BaseException as error:
+        if first_error is None:
+            first_error = error
+    if first_error is not None:
+        raise first_error
+
+
 def _first_state_mismatch(state, candidate):
     ordered = ("schema_version", "student_id", "updated_at", "subjects", "process")
     for field in ordered:
@@ -239,7 +263,9 @@ def open_workspace_descriptor(workspace):
         raise ValidationError(f"workspace cannot be opened: {error}") from error
 
 
-def _read_workspace_snapshot_fd_unlocked(root_fd, require_consistent_state=True):
+def _read_workspace_snapshot_fd_unlocked(
+    root_fd, require_consistent_state=True, include_observations=True
+):
     """Read required children while the caller holds the workspace lock."""
     opened_files = []
     opened_directories = []
@@ -247,7 +273,12 @@ def _read_workspace_snapshot_fd_unlocked(root_fd, require_consistent_state=True)
     try:
         for name in REQUIRED_REGULAR_FILES:
             opened_files.append((name, _open_existing_regular(root_fd, name)))
-        for name in REQUIRED_DIRECTORIES:
+        directory_names = REQUIRED_DIRECTORIES
+        if not include_observations:
+            directory_names = tuple(
+                name for name in REQUIRED_DIRECTORIES if name != "observations"
+            )
+        for name in directory_names:
             opened_directories.append((name, _open_existing_directory(root_fd, name)))
 
         file_descriptors = dict(opened_files)
@@ -267,9 +298,22 @@ def _read_workspace_snapshot_fd_unlocked(root_fd, require_consistent_state=True)
             validate_plan_fact,
             "plan_item",
         )
+        observations = ()
+        if include_observations:
+            observations = _read_fact_directory(
+                directory_descriptors["observations"],
+                "observations",
+                validate_observation_fact,
+                "interaction_observation",
+            )
+        record_ids = set()
+        for fact in (*sessions, *plan_items, *observations):
+            record_id = fact["record_id"]
+            require(record_id not in record_ids, f"duplicate record_id: {record_id}")
+            record_ids.add(record_id)
         if require_consistent_state:
             validate_state(state, sessions, plan_items)
-        return WorkspaceSnapshot(state, sessions, plan_items)
+        return WorkspaceSnapshot(state, sessions, plan_items, observations)
     except BaseException:
         body_failed = True
         raise
@@ -284,16 +328,69 @@ def _read_workspace_snapshot_fd_unlocked(root_fd, require_consistent_state=True)
                 raise
 
 
-def read_workspace_snapshot_fd(root_fd, require_consistent_state=True):
+def _validate_expected_student_id(expected_student_id):
+    if expected_student_id is None:
+        return None
+    require(
+        isinstance(expected_student_id, str)
+        and STUDENT_ID.fullmatch(expected_student_id),
+        "expected student_id is invalid",
+    )
+    return expected_student_id
+
+
+def _read_workspace_student_id_fd_unlocked(root_fd):
+    """Read only the state identity while the caller holds the workspace lock."""
+    state_fd = _open_existing_regular(root_fd, "state.json")
+    body_failed = False
+    try:
+        state = _read_json_fd(state_fd, "state.json")
+        require(isinstance(state, dict), "state must be an object")
+        student_id = state.get("student_id")
+        require(
+            isinstance(student_id, str) and STUDENT_ID.fullmatch(student_id),
+            "student_id must use lowercase letters, digits, and hyphens",
+        )
+        return student_id
+    except BaseException:
+        body_failed = True
+        raise
+    finally:
+        try:
+            os.close(state_fd)
+        except BaseException:
+            if not body_failed:
+                raise
+
+
+def _require_expected_student_fd_unlocked(root_fd, expected_student_id):
+    expected_student_id = _validate_expected_student_id(expected_student_id)
+    if expected_student_id is None:
+        return None
+    require(
+        _read_workspace_student_id_fd_unlocked(root_fd) == expected_student_id,
+        "workspace state student_id does not match requested student_id",
+    )
+    return expected_student_id
+
+
+def read_workspace_snapshot_fd(
+    root_fd,
+    require_consistent_state=True,
+    expected_student_id=None,
+):
     """Read one snapshot while holding the workspace's shared lock."""
+    _validate_expected_student_id(expected_student_id)
     lock_fd = _open_existing_regular(root_fd, ".workspace.lock")
     body_failed = False
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_SH)
-        return _read_workspace_snapshot_fd_unlocked(
+        _require_expected_student_fd_unlocked(root_fd, expected_student_id)
+        snapshot = _read_workspace_snapshot_fd_unlocked(
             root_fd,
             require_consistent_state,
         )
+        return _require_expected_student(snapshot, expected_student_id)
     except BaseException:
         body_failed = True
         raise
@@ -305,12 +402,43 @@ def read_workspace_snapshot_fd(root_fd, require_consistent_state=True):
                 raise
 
 
-def read_workspace_snapshot(workspace, require_consistent_state=True):
+def _require_expected_student(snapshot, expected_student_id):
+    expected_student_id = _validate_expected_student_id(expected_student_id)
+    if expected_student_id is None:
+        return snapshot
+    require(
+        snapshot.state["student_id"] == expected_student_id,
+        "workspace state student_id does not match requested student_id",
+    )
+    return snapshot
+
+
+def read_workspace_snapshot(
+    workspace,
+    require_consistent_state=True,
+    expected_student_id=None,
+):
     """Return an immutable snapshot read from one held workspace descriptor."""
+    _validate_expected_student_id(expected_student_id)
     root_fd = open_workspace_descriptor(workspace)
     body_failed = False
     try:
-        return read_workspace_snapshot_fd(root_fd, require_consistent_state)
+        # Legacy workspaces predate the observation store. Inspect and migrate
+        # relative to the same held descriptor used for the final snapshot.
+        try:
+            os.stat("observations", dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            snapshot = migrate_workspace_fd(
+                root_fd,
+                expected_student_id=expected_student_id,
+            )
+        else:
+            snapshot = read_workspace_snapshot_fd(
+                root_fd,
+                require_consistent_state,
+                expected_student_id=expected_student_id,
+            )
+        return _require_expected_student(snapshot, expected_student_id)
     except BaseException:
         body_failed = True
         raise
@@ -322,20 +450,105 @@ def read_workspace_snapshot(workspace, require_consistent_state=True):
                 raise
 
 
-def validate_workspace(workspace):
-    return read_workspace_snapshot(workspace, require_consistent_state=True)
+def validate_workspace(workspace, expected_student_id=None):
+    return read_workspace_snapshot(
+        workspace,
+        require_consistent_state=True,
+        expected_student_id=expected_student_id,
+    )
 
 
-def validate_workspace_fd(root_fd):
-    return read_workspace_snapshot_fd(root_fd, require_consistent_state=True)
+def validate_workspace_fd(root_fd, expected_student_id=None):
+    return read_workspace_snapshot_fd(
+        root_fd,
+        require_consistent_state=True,
+        expected_student_id=expected_student_id,
+    )
+
+
+def migrate_workspace(workspace, expected_student_id=None):
+    """Add newly introduced workspace directories without replacing data."""
+    _validate_expected_student_id(expected_student_id)
+    root_fd = open_workspace_descriptor(workspace)
+    body_failed = False
+    try:
+        migrate_workspace_fd(
+            root_fd,
+            expected_student_id=expected_student_id,
+        )
+    except BaseException:
+        body_failed = True
+        raise
+    finally:
+        try:
+            os.close(root_fd)
+        except BaseException:
+            if not body_failed:
+                raise
+
+
+def migrate_workspace_fd(root_fd, expected_student_id=None):
+    """Migrate one held workspace directory without resolving its path again."""
+    _validate_expected_student_id(expected_student_id)
+    lock_fd = None
+    body_failed = False
+    try:
+        lock_fd = _open_existing_regular(root_fd, ".workspace.lock", writable=True)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        _require_expected_student_fd_unlocked(root_fd, expected_student_id)
+        try:
+            os.stat("observations", dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            directory_fd = _open_existing_directory(root_fd, "observations")
+            os.close(directory_fd)
+            if expected_student_id is None:
+                return None
+            snapshot = _read_workspace_snapshot_fd_unlocked(
+                root_fd,
+                require_consistent_state=False,
+            )
+            return _require_expected_student(snapshot, expected_student_id)
+
+        legacy_snapshot = _read_workspace_snapshot_fd_unlocked(
+            root_fd,
+            require_consistent_state=True,
+            include_observations=False,
+        )
+        _require_expected_student(legacy_snapshot, expected_student_id)
+        try:
+            os.mkdir("observations", mode=0o700, dir_fd=root_fd)
+        except FileExistsError:
+            # Re-open with O_NOFOLLOW and verify the existing entry is a directory.
+            directory_fd = _open_existing_directory(root_fd, "observations")
+            os.close(directory_fd)
+        os.fsync(root_fd)
+        return _require_expected_student(
+            _read_workspace_snapshot_fd_unlocked(
+                root_fd, require_consistent_state=True
+            ),
+            expected_student_id,
+        )
+    except BaseException:
+        body_failed = True
+        raise
+    finally:
+        if lock_fd is not None:
+            try:
+                _cleanup_lock_descriptor(lock_fd)
+            except BaseException:
+                if not body_failed:
+                    raise
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workspace", type=Path)
+    parser.add_argument("--student-id", required=True)
     args = parser.parse_args()
     try:
-        validate_workspace(args.workspace)
+        validate_workspace(args.workspace, expected_student_id=args.student_id)
     except (OSError, ValidationError) as error:
         print(f"INVALID: {error}", file=sys.stderr)
         return 1

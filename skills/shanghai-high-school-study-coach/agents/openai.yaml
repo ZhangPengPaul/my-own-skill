@@ -1,4 +1,4 @@
 interface:
   display_name: "上海高中学习教练"
-  short_description: "根据学生真实作答识别六科薄弱点，并通过针对性练习持续强化"
-  default_prompt: "Use $shanghai-high-school-study-coach to diagnose my current weak points from my actual work, teach the missing part, and guide one targeted verification step."
+  short_description: "自然回答上海高中六科问题，并跨会话识别和验证薄弱点"
+  default_prompt: "Use $shanghai-high-school-study-coach to answer an ordinary question naturally, prioritize the current question, and use gradual observation of recurring signals to guide teaching or targeted practice without forcing a diagnosis first."

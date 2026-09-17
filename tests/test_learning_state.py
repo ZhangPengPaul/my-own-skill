@@ -105,6 +105,93 @@ class FactSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "fields are invalid"):
             validate_observation_fact(fact)
 
+    def test_interaction_observation_summary_fields_enforce_specific_limits(self):
+        limits = {
+            "target_name": 120,
+            "signal": 240,
+            "student_action": 160,
+            "uncertainty": 240,
+        }
+        for field, limit in limits.items():
+            with self.subTest(field=field, boundary="accepted"):
+                validate_observation_fact(
+                    interaction_observation(**{field: "摘" * limit})
+                )
+            with self.subTest(field=field, boundary="rejected"):
+                with self.assertRaisesRegex(ValidationError, field):
+                    validate_observation_fact(
+                        interaction_observation(**{field: "摘" * (limit + 1)})
+                    )
+
+    def test_interaction_observation_summary_fields_reject_whitespace_and_controls(self):
+        invalid_values = (
+            " leading",
+            "trailing ",
+            "line\nbreak",
+            "contains\ttab",
+            "contains\x00null",
+            "direction\u202eoverride",
+        )
+        for field in ("target_name", "signal", "student_action", "uncertainty"):
+            for invalid in invalid_values:
+                with self.subTest(field=field, invalid=repr(invalid)):
+                    with self.assertRaisesRegex(ValidationError, field):
+                        validate_observation_fact(
+                            interaction_observation(**{field: invalid})
+                        )
+
+    def test_interaction_observation_uncertainty_may_be_null(self):
+        validate_observation_fact(interaction_observation(uncertainty=None))
+
+    def test_interaction_observation_signal_kind_is_bounded_ascii_slug(self):
+        for valid in ("a", "form-selection", "execution_pattern", "a" * 64):
+            with self.subTest(valid=valid):
+                validate_observation_fact(
+                    interaction_observation(signal_kind=valid)
+                )
+        for invalid in ("", "_leading", "UPPER", "含义混淆", "has space", "a" * 65):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValidationError, "signal_kind"):
+                    validate_observation_fact(
+                        interaction_observation(signal_kind=invalid)
+                    )
+
+    def test_interaction_observation_target_id_is_dotted_slug(self):
+        for invalid in (
+            "mathematics",
+            "mathematics..geometry",
+            "mathematics.geometry_raw",
+            "mathematics.Geometry.angle",
+            "mathematics.geometry.原题",
+            "mathematics.geometry.-angle",
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValidationError, "target_id"):
+                    validate_observation_fact(
+                        interaction_observation(target_id=invalid)
+                    )
+
+    def test_interaction_observation_rejects_obvious_embedded_payloads(self):
+        payloads = (
+            ("target_name", "notes %PDF-1.7 payload"),
+            ("student_action", "DATA:IMAGE/png;base64,AAAA"),
+            ("uncertainty", "data:application/pdf;base64,AAAA"),
+            ("signal", "QUJD" * 32),
+            ("signal", "deadbeef" * 16),
+        )
+        for field, payload in payloads:
+            with self.subTest(field=field, payload=payload[:24]):
+                with self.assertRaisesRegex(ValidationError, "payload"):
+                    validate_observation_fact(
+                        interaction_observation(**{field: payload})
+                    )
+
+    def test_interaction_observation_canonical_json_is_at_most_four_kib(self):
+        with self.assertRaisesRegex(ValidationError, "4 KiB"):
+            validate_observation_fact(
+                interaction_observation(signal="x" * 5000)
+            )
+
     def test_interaction_observation_rejects_derived_confirmed_strength(self):
         fact = interaction_observation(evidence_strength="confirmed")
         with self.assertRaisesRegex(ValidationError, "evidence_strength"):
@@ -118,7 +205,8 @@ class FactSchemaTest(unittest.TestCase):
     def test_interaction_observation_target_mismatch_is_excluded(self):
         first = interaction_observation()
         second = interaction_observation(
-            record_id="observation-002", target_id="mathematics.geometry.other"
+            record_id="observation-002", interaction_id="interaction-002",
+            target_id="mathematics.geometry.other"
         )
         summaries = aggregate_observations([first, second])
         self.assertEqual((), summaries)
@@ -163,6 +251,55 @@ class FactSchemaTest(unittest.TestCase):
 
     def test_completed_session_may_record_direct_explanation_without_evidence(self):
         validate_session_fact(session_fact(student_attempt=None, observations=[]))
+
+    def test_session_observation_resolution_signal_kinds_are_optional_for_legacy_v2(self):
+        observation = knowledge_observation()
+        observation.pop("resolves_observation_signal_kinds")
+
+        validate_session_fact(session_fact(observations=[observation]))
+
+    def test_session_observation_accepts_distinct_ascii_resolution_signal_kinds(self):
+        validate_session_fact(
+            session_fact(
+                observations=[
+                    knowledge_observation(
+                        resolves_observation_signal_kinds=[
+                            "content_gap",
+                            "representation-selection",
+                            "execution_pattern",
+                        ]
+                    )
+                ]
+            )
+        )
+
+    def test_session_observation_rejects_invalid_resolution_signal_kinds(self):
+        invalid_values = (
+            None,
+            "content_gap",
+            [""],
+            ["_leading"],
+            ["UPPER"],
+            ["non ascii"],
+            ["含义混淆"],
+            ["a" * 65],
+            ["content_gap", "content_gap"],
+        )
+        for invalid in invalid_values:
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(
+                    ValidationError,
+                    "resolves_observation_signal_kinds",
+                ):
+                    validate_session_fact(
+                        session_fact(
+                            observations=[
+                                knowledge_observation(
+                                    resolves_observation_signal_kinds=invalid
+                                )
+                            ]
+                        )
+                    )
 
     def test_zulu_timestamps_are_accepted_by_all_consumers(self):
         session = session_fact(

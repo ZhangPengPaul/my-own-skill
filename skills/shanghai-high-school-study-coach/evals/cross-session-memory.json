@@ -1,0 +1,234 @@
+{
+  "schema_version": 2,
+  "student_id": "cross-session-memory-student",
+  "cases": [
+    {
+      "id": "with-history",
+      "description": "A second independent session reads the prior structured observation from its private workspace.",
+      "stages": [
+        {
+          "id": "first-observation",
+          "prompt": "Use $shanghai-high-school-study-coach for student ID cross-session-memory-student. The student asks: 在二面角图里，我分不清哪个角才是平面角。Please answer naturally.",
+          "expectations": [
+            {
+              "id": "current-answer",
+              "criterion": "Across the complete visible_messages sequence, the complete first sentence of the first visible message, taken as a whole including semicolon-separated clauses, must accurately explain the general definition before any follow-up: the angle is formed by two rays from the same point on the edge, one in each face and both perpendicular to the edge. An incomplete or incorrect first sentence fails even if later text is correct; a later sentence cannot cure it."
+            },
+            {
+              "id": "natural-coaching-surface",
+              "criterion": "The complete visible_messages sequence feels like natural tutoring: at most one brief learning-focused transition may precede the final response, and no visible message narrates skill activation, memory, student IDs, workspace, files, commands, persistence, validation operations, or internal labels."
+            },
+            {
+              "id": "no-premature-diagnosis",
+              "criterion": "Does not label a confirmed weakness from one interaction."
+            },
+            {
+              "id": "no-unsolicited-practice",
+              "criterion": "Does not append any unsolicited practice or validation task after answering; with only one observation, the interaction ends unless the student asks for more."
+            },
+            {
+              "id": "observation-semantic-fit",
+              "criterion": "Exactly one new observation in the trusted artifact summary faithfully and concisely represents this interaction as an unconfirmed difficulty identifying which angle is the plane angle of a dihedral angle; its target, signal, student action, and uncertainty are consistent with the student's question and do not invent an attempted solution."
+            },
+            {
+              "id": "persist-weak-observation",
+              "criterion": "The trusted artifact summary shows exactly one structured weak observation was persisted."
+            }
+          ],
+          "workspace_expectations": {
+            "observation_count": 1,
+            "evidence_strength_counts": {
+              "weak": 1,
+              "repeated": 0
+            },
+            "pending_validation_count": 0,
+            "observation_targets": [
+              {
+                "subject": "mathematics",
+                "module_id": "geometry",
+                "target_kind": "knowledge_unit",
+                "observation_count": 1
+              }
+            ],
+            "forbidden_texts": [
+              {
+                "id": "raw-question",
+                "text": "在二面角图里，我分不清哪个角才是平面角",
+                "source": "prompt"
+              }
+            ]
+          }
+        },
+        {
+          "id": "second-observation",
+          "prompt": "Use $shanghai-high-school-study-coach for student ID cross-session-memory-student in this fresh session. The student asks: 作出垂直于棱的平面以后，我应该量哪个角？Please answer naturally.",
+          "expectations": [
+            {
+              "id": "current-answer",
+              "criterion": "Across the complete visible_messages sequence, the complete first sentence of the first visible message, taken as a whole including semicolon-separated clauses, must accurately identify the angle between the two rays where the perpendicular cross-section meets the specified half-planes, directed into the dihedral angle, not merely perpendicular feet, before any follow-up. An incomplete or incorrect first sentence fails even if later text is correct; a later sentence cannot cure it."
+            },
+            {
+              "id": "natural-coaching-surface",
+              "criterion": "The complete visible_messages sequence feels like natural tutoring: at most one brief learning-focused transition may precede the final response, and no visible message narrates skill activation, memory, student IDs, workspace, files, commands, persistence, validation operations, or internal labels."
+            },
+            {
+              "id": "natural-validation-transition",
+              "criterion": "After answering, naturally and briefly moves into a small check without mentioning or implying prior interactions, repeated observations, memory, or a diagnostic process, and without publicly discussing possible causes, uncertainty, or whether the student has a weakness."
+            },
+            {
+              "id": "exactly-one-validation",
+              "criterion": "After answering, asks exactly one small low-interruption validation task in a minimally changed context that directly tests only the narrowest common behavior supported by every member in pending_observation_groups.member_observations and leaves it unanswered for the student. The answer has not appeared anywhere earlier in visible_messages. Changing only point or ray letters is still the same representation and must fail. For this angle-selection scenario, the task must present at least two candidate angles or at least one distractor ray or angle, or use another genuinely different representation that forces a real selection; naming exactly two already-identified intersection rays and asking which angle they form fails. Related blanks or steps for one judgment count as one task."
+            },
+            {
+              "id": "observation-semantic-fit",
+              "criterion": "Exactly one new observation in the trusted artifact summary faithfully and concisely represents this interaction as an unconfirmed difficulty identifying which angle to measure after constructing a plane perpendicular to the edge; its target, signal, student action, and uncertainty are consistent with the student's question and do not invent an attempted solution."
+            },
+            {
+              "id": "persist-second-weak-observation",
+              "criterion": "The trusted artifact summary shows exactly two accumulated weak observations and no repeated-strength observation."
+            }
+          ],
+          "workspace_expectations": {
+            "observation_count": 2,
+            "evidence_strength_counts": {
+              "weak": 2,
+              "repeated": 0
+            },
+            "pending_validation_count": 1,
+            "observation_targets": [
+              {
+                "subject": "mathematics",
+                "module_id": "geometry",
+                "target_kind": "knowledge_unit",
+                "observation_count": 2
+              }
+            ],
+            "forbidden_texts": [
+              {
+                "id": "raw-question",
+                "text": "作出垂直于棱的平面以后，我应该量哪个角",
+                "source": "prompt"
+              }
+            ]
+          }
+        },
+        {
+          "id": "third-existing-pending",
+          "prompt": "Use $shanghai-high-school-study-coach for student ID cross-session-memory-student in this fresh session. The student asks: 截面里两条交线会形成一对邻补角，我该选哪一个表示题目中的二面角？Please answer naturally.",
+          "expectations": [
+            {
+              "id": "current-answer",
+              "criterion": "Across the complete visible_messages sequence, the complete first sentence of the first visible message, taken as a whole including semicolon-separated clauses, must accurately say to choose the angle between the two intersection rays that lies inside the specific dihedral region named by the problem, rather than automatically choosing its supplementary neighbor. An incomplete or incorrect first sentence fails even if later text is correct; a later sentence cannot cure it."
+            },
+            {
+              "id": "natural-coaching-surface",
+              "criterion": "The complete visible_messages sequence feels like natural tutoring: at most one brief learning-focused transition may precede the final response, and no visible message narrates skill activation, memory, student IDs, workspace, files, commands, persistence, validation operations, or internal labels."
+            },
+            {
+              "id": "no-false-diagnosis",
+              "criterion": "Does not mention or imply prior interactions, repeated observations, memory, a diagnostic process, possible causes, or whether the student has a weakness."
+            },
+            {
+              "id": "no-unsolicited-practice",
+              "criterion": "Does not append any practice, exercise, quiz, or validation task after answering. The pending group already existed before this interaction, so this 2-to-3 transition must not trigger another check."
+            },
+            {
+              "id": "observation-semantic-fit",
+              "criterion": "Exactly one new observation in the trusted artifact summary faithfully and concisely represents this interaction as an unconfirmed difficulty selecting which of the supplementary angles represents the specified dihedral angle; its target, signal, student action, and uncertainty are consistent with the student's question and do not invent an attempted solution."
+            },
+            {
+              "id": "persist-third-weak-observation",
+              "criterion": "The trusted artifact summary shows exactly three accumulated weak observations, one already-pending group, and no repeated-strength observation."
+            }
+          ],
+          "workspace_expectations": {
+            "observation_count": 3,
+            "evidence_strength_counts": {
+              "weak": 3,
+              "repeated": 0
+            },
+            "pending_validation_count": 1,
+            "observation_targets": [
+              {
+                "subject": "mathematics",
+                "module_id": "geometry",
+                "target_kind": "knowledge_unit",
+                "observation_count": 3
+              }
+            ],
+            "forbidden_texts": [
+              {
+                "id": "raw-question",
+                "text": "截面里两条交线会形成一对邻补角，我该选哪一个表示题目中的二面角",
+                "source": "prompt"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "without-history-control",
+      "description": "The same second-round question starts in an empty private workspace.",
+      "stages": [
+        {
+          "id": "second-observation",
+          "prompt": "Use $shanghai-high-school-study-coach for student ID cross-session-memory-student in this fresh session. The student asks: 作出垂直于棱的平面以后，我应该量哪个角？Please answer naturally.",
+          "expectations": [
+            {
+              "id": "current-answer",
+              "criterion": "Across the complete visible_messages sequence, the complete first sentence of the first visible message, taken as a whole including semicolon-separated clauses, must accurately identify the angle between the two rays where the perpendicular cross-section meets the specified half-planes, directed into the dihedral angle, not merely perpendicular feet. An incomplete or incorrect first sentence fails even if later text is correct; a later sentence cannot cure it."
+            },
+            {
+              "id": "natural-coaching-surface",
+              "criterion": "The complete visible_messages sequence feels like natural tutoring: at most one brief learning-focused transition may precede the final response, and no visible message narrates skill activation, memory, student IDs, workspace, files, commands, persistence, validation operations, or internal labels."
+            },
+            {
+              "id": "no-false-history",
+              "criterion": "Does not claim a repeated signal or confirmed weakness when the trusted artifact summary shows only one observation."
+            },
+            {
+              "id": "no-repeated-signal-validation",
+              "criterion": "Does not present a follow-up task as justified by a repeated historical signal."
+            },
+            {
+              "id": "no-unsolicited-practice",
+              "criterion": "Does not append any practice, exercise, quiz, or validation task after answering the student's question."
+            },
+            {
+              "id": "observation-semantic-fit",
+              "criterion": "Exactly one new observation in the trusted artifact summary faithfully and concisely represents this interaction as an unconfirmed difficulty identifying which angle to measure after constructing a plane perpendicular to the edge; its target, signal, student action, and uncertainty are consistent with the student's question and do not invent an attempted solution."
+            },
+            {
+              "id": "persist-weak-observation",
+              "criterion": "The trusted artifact summary shows exactly one structured weak observation was persisted."
+            }
+          ],
+          "workspace_expectations": {
+            "observation_count": 1,
+            "evidence_strength_counts": {
+              "weak": 1,
+              "repeated": 0
+            },
+            "pending_validation_count": 0,
+            "observation_targets": [
+              {
+                "subject": "mathematics",
+                "module_id": "geometry",
+                "target_kind": "knowledge_unit",
+                "observation_count": 1
+              }
+            ],
+            "forbidden_texts": [
+              {
+                "id": "raw-question",
+                "text": "作出垂直于棱的平面以后，我应该量哪个角",
+                "source": "prompt"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,7 +1,9 @@
 """Validate structured learning facts and their evidence records."""
 
 from datetime import datetime, timezone
+import json
 import re
+import unicodedata
 
 
 SUBJECTS = (
@@ -115,6 +117,18 @@ INTERACTION_KINDS = (
 )
 
 ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,95}$")
+OBSERVATION_SIGNAL_KIND = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+OBSERVATION_TARGET_ID = re.compile(
+    r"^[a-z0-9]+(?:-[a-z0-9]+)*(?:\.[a-z0-9]+(?:-[a-z0-9]+)*)+$"
+)
+LONG_BASE64_PAYLOAD = re.compile(r"[A-Za-z0-9+/]{128,}={0,2}")
+LONG_HEX_PAYLOAD = re.compile(r"[A-Fa-f0-9]{128,}")
+OBSERVATION_MAX_CANONICAL_BYTES = 4 * 1024
+OBSERVATION_PAYLOAD_MARKERS = (
+    "%pdf-",
+    "data:image/",
+    "data:application/pdf",
+)
 
 
 class ValidationError(ValueError):
@@ -162,10 +176,54 @@ def _require_optional_string(value, field):
     )
 
 
+def _require_observation_summary(value, field, max_length, allow_none=False):
+    if allow_none and value is None:
+        return
+    require(
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and len(value) <= max_length
+        and not any(
+            unicodedata.category(character).startswith("C")
+            for character in value
+        ),
+        f"{field} must be nonempty summary text of at most {max_length} characters "
+        "without surrounding whitespace or control characters",
+    )
+
+
+def _contains_obvious_observation_payload(value):
+    folded = value.casefold()
+    return (
+        any(marker in folded for marker in OBSERVATION_PAYLOAD_MARKERS)
+        or LONG_BASE64_PAYLOAD.search(value) is not None
+        or LONG_HEX_PAYLOAD.search(value) is not None
+    )
+
+
+def _canonical_observation_json(fact):
+    try:
+        return (
+            json.dumps(fact, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+    except (TypeError, UnicodeError, ValueError):
+        return None
+
+
 def _require_exact_keys(value, expected, label):
     require(
         set(value) == expected,
         f"{label} fields are invalid: {sorted(set(value) ^ expected)}",
+    )
+
+
+def _require_optional_keys(value, required, optional, label):
+    fields = set(value)
+    invalid = (required - fields) | (fields - required - optional)
+    require(
+        not invalid,
+        f"{label} fields are invalid: {sorted(invalid)}",
     )
 
 
@@ -200,7 +258,7 @@ def _validate_mode_transition(transition):
 
 def validate_observation(observation, subject):
     require(isinstance(observation, dict), "observation must be an object")
-    _require_exact_keys(
+    _require_optional_keys(
         observation,
         {
             "evidence_id",
@@ -218,6 +276,7 @@ def validate_observation(observation, subject):
             "next_review_at",
             "uncertainty",
         },
+        {"resolves_observation_signal_kinds"},
         "observation",
     )
     _require_id(observation.get("evidence_id"), "evidence_id")
@@ -252,6 +311,19 @@ def validate_observation(observation, subject):
         observation.get("evidence_type") in EVIDENCE_TYPES,
         "evidence_type is invalid",
     )
+    if "resolves_observation_signal_kinds" in observation:
+        signal_kinds = observation["resolves_observation_signal_kinds"]
+        require(
+            isinstance(signal_kinds, list)
+            and all(
+                isinstance(signal_kind, str)
+                and OBSERVATION_SIGNAL_KIND.fullmatch(signal_kind)
+                for signal_kind in signal_kinds
+            )
+            and len(signal_kinds) == len(set(signal_kinds)),
+            "resolves_observation_signal_kinds must be a list of distinct "
+            "ASCII signal_kind slugs",
+        )
     require(
         observation.get("outcome") in ("correct", "incorrect"),
         "outcome is invalid",
@@ -323,6 +395,18 @@ def validate_observation_fact(fact):
         },
         "observation fact",
     )
+    canonical_json = _canonical_observation_json(fact)
+    if canonical_json is not None:
+        require(
+            len(canonical_json) <= OBSERVATION_MAX_CANONICAL_BYTES,
+            "observation fact canonical JSON must be at most 4 KiB",
+        )
+    for field, value in fact.items():
+        if isinstance(value, str):
+            require(
+                not _contains_obvious_observation_payload(value),
+                f"{field} contains an obvious embedded payload",
+            )
     require(
         fact.get("schema_version") == 1
         and type(fact.get("schema_version")) is int,
@@ -349,24 +433,24 @@ def validate_observation_fact(fact):
     target_id = fact.get("target_id")
     require(
         isinstance(target_id, str)
-        and (target_id == "pending-normalization" or target_id.startswith(subject + "."))
+        and (
+            target_id == "pending-normalization"
+            or (
+                target_id.startswith(subject + ".")
+                and OBSERVATION_TARGET_ID.fullmatch(target_id)
+            )
+        )
         and len(target_id) <= 256,
-        "target_id must match observation subject or be pending-normalization",
+        "target_id must be a dotted slug matching the observation subject "
+        "or pending-normalization",
     )
+    _require_observation_summary(fact.get("target_name"), "target_name", 120)
     require(
-        isinstance(fact.get("target_name"), str) and fact["target_name"].strip(),
-        "target_name is required",
+        isinstance(fact.get("signal_kind"), str)
+        and OBSERVATION_SIGNAL_KIND.fullmatch(fact["signal_kind"]),
+        "signal_kind must be an ASCII slug of at most 64 characters",
     )
-    require(
-        isinstance(fact.get("signal_kind"), str) and fact["signal_kind"].strip(),
-        "signal_kind is required",
-    )
-    require(
-        isinstance(fact.get("signal"), str)
-        and fact["signal"].strip()
-        and len(fact["signal"]) <= 500,
-        "signal is required and must be at most 500 characters",
-    )
+    _require_observation_summary(fact.get("signal"), "signal", 240)
     require(
         fact.get("evidence_strength") in OBSERVATION_STRENGTHS,
         "evidence_strength is invalid",
@@ -375,13 +459,10 @@ def validate_observation_fact(fact):
         fact.get("interaction_kind") in INTERACTION_KINDS,
         "interaction_kind is invalid",
     )
-    require(
-        isinstance(fact.get("student_action"), str)
-        and fact["student_action"].strip()
-        and len(fact["student_action"]) <= 500,
-        "student_action is required and must be at most 500 characters",
+    _require_observation_summary(fact.get("student_action"), "student_action", 160)
+    _require_observation_summary(
+        fact.get("uncertainty"), "uncertainty", 240, allow_none=True
     )
-    _require_optional_string(fact.get("uncertainty"), "uncertainty")
 
 
 def aggregate_observations(observations):

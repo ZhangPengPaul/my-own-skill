@@ -17,7 +17,11 @@ from learning_state import ValidationError, reconcile_state, validate_fact
 from validate_student_data import (
     _open_existing_directory,
     _open_existing_regular,
+    _require_expected_student,
+    _require_expected_student_fd_unlocked,
     _read_workspace_snapshot_fd_unlocked,
+    _validate_expected_student_id,
+    migrate_workspace_fd,
     open_workspace_descriptor,
     validate_state,
 )
@@ -327,22 +331,28 @@ def _cleanup_commit_descriptors(fact_directory_fd, lock_fd, root_fd):
         raise first_error
 
 
-def commit_fact(workspace, fact, now=None):
+def commit_fact(workspace, fact, now=None, expected_student_id=None):
     """Publish one immutable fact and reconcile state under one exclusive lock."""
+    _validate_expected_student_id(expected_student_id)
     validate_fact(fact)
     root_fd = open_workspace_descriptor(workspace)
     lock_fd = None
     fact_directory_fd = None
     body_failed = False
     try:
+        # Migrate and commit relative to the same held workspace descriptor so
+        # a path replacement cannot redirect the write to another student.
+        migrate_workspace_fd(root_fd, expected_student_id=expected_student_id)
         lock_fd = _open_existing_regular(root_fd, ".workspace.lock", writable=True)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        _require_expected_student_fd_unlocked(root_fd, expected_student_id)
         snapshot = _read_workspace_snapshot_fd_unlocked(
             root_fd,
             require_consistent_state=False,
         )
+        _require_expected_student(snapshot, expected_student_id)
         existing_by_record_id = {}
-        for existing in snapshot.sessions + snapshot.plan_items:
+        for existing in snapshot.sessions + snapshot.plan_items + snapshot.observations:
             record_id = existing["record_id"]
             if record_id in existing_by_record_id:
                 raise ValidationError("duplicate record_id: %s" % record_id)
@@ -362,48 +372,59 @@ def commit_fact(workspace, fact, now=None):
         commit_time = now or datetime.now(timezone.utc).isoformat()
         prospective_sessions = list(snapshot.sessions)
         prospective_plan_items = list(snapshot.plan_items)
-        if existing is None:
-            prospective = (
-                prospective_sessions
-                if fact["record_type"] == "session"
-                else prospective_plan_items
+        if fact["record_type"] == "interaction_observation":
+            # Observations never derive or replace state, but fail closed when
+            # the existing state is already inconsistent with active facts.
+            validate_state(
+                snapshot.state,
+                prospective_sessions,
+                prospective_plan_items,
             )
-            prospective.append(fact)
-        candidate = reconcile_state(
-            snapshot.state["student_id"],
-            prospective_sessions,
-            prospective_plan_items,
-            previous_state=snapshot.state,
-            now=commit_time,
-        )
-        validate_state(
-            candidate,
-            prospective_sessions,
-            prospective_plan_items,
-        )
+        if existing is None:
+            if fact["record_type"] == "session":
+                prospective_sessions.append(fact)
+            elif fact["record_type"] == "plan_item":
+                prospective_plan_items.append(fact)
+        if fact["record_type"] != "interaction_observation":
+            candidate = reconcile_state(
+                snapshot.state["student_id"],
+                prospective_sessions,
+                prospective_plan_items,
+                previous_state=snapshot.state,
+                now=commit_time,
+            )
+            validate_state(
+                candidate,
+                prospective_sessions,
+                prospective_plan_items,
+            )
 
-        directory_name = (
-            "sessions" if fact["record_type"] == "session" else "plan-items"
-        )
+        directory_name = {
+            "session": "sessions",
+            "plan_item": "plan-items",
+            "interaction_observation": "observations",
+        }[fact["record_type"]]
         fact_directory_fd = _open_existing_directory(root_fd, directory_name)
         published = _publish_fact_no_clobber(fact_directory_fd, fact)
 
         snapshot = _read_workspace_snapshot_fd_unlocked(
             root_fd, require_consistent_state=False
         )
-        candidate = reconcile_state(
-            snapshot.state["student_id"],
-            snapshot.sessions,
-            snapshot.plan_items,
-            previous_state=snapshot.state,
-            now=commit_time,
-        )
-        validate_state(candidate, snapshot.sessions, snapshot.plan_items)
-        if candidate != snapshot.state:
-            _replace_state_atomically(root_fd, candidate)
+        _require_expected_student(snapshot, expected_student_id)
+        if fact["record_type"] != "interaction_observation":
+            candidate = reconcile_state(
+                snapshot.state["student_id"],
+                snapshot.sessions,
+                snapshot.plan_items,
+                previous_state=snapshot.state,
+                now=commit_time,
+            )
+            validate_state(candidate, snapshot.sessions, snapshot.plan_items)
+            if candidate != snapshot.state:
+                _replace_state_atomically(root_fd, candidate)
         _read_workspace_snapshot_fd_unlocked(
             root_fd,
-            require_consistent_state=True,
+            require_consistent_state=(fact["record_type"] != "interaction_observation"),
         )
         return published
     except BaseException:
@@ -442,10 +463,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workspace", type=Path)
     parser.add_argument("--fact-file", type=Path, required=True)
+    parser.add_argument("--student-id", required=True)
     args = parser.parse_args()
     try:
+        _validate_expected_student_id(args.student_id)
         fact = _read_fact_file(args.fact_file)
-        published = commit_fact(args.workspace, fact)
+        published = commit_fact(
+            args.workspace,
+            fact,
+            expected_student_id=args.student_id,
+        )
     except (OSError, ValidationError) as error:
         print("ERROR: %s" % error, file=sys.stderr)
         return 1

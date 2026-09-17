@@ -41,6 +41,30 @@ def knowledge_observation(**overrides):
         "student_explanation": None,
         "next_review_at": None,
         "uncertainty": None,
+        "resolves_observation_signal_kinds": [],
+    }
+    value.update(overrides)
+    return value
+
+
+def interaction_observation(**overrides):
+    value = {
+        "schema_version": 1,
+        "record_type": "interaction_observation",
+        "record_id": "observation-001",
+        "interaction_id": "interaction-001",
+        "occurred_at": "2026-08-06T10:00:00+00:00",
+        "subject": "mathematics",
+        "module_id": "geometry",
+        "target_kind": "knowledge_unit",
+        "target_id": "mathematics.geometry.dihedral-angle",
+        "target_name": "二面角的平面角",
+        "signal_kind": "content_gap",
+        "signal": "cannot identify the relevant angle",
+        "evidence_strength": "weak",
+        "interaction_kind": "photo_question",
+        "student_action": "asked how to solve the problem",
+        "uncertainty": "single observation",
     }
     value.update(overrides)
     return value
@@ -98,12 +122,13 @@ def create_workspace(
     workspace,
     sessions=(),
     plan_items=(),
+    observations=(),
     state=None,
 ):
     workspace.mkdir(parents=True)
     (workspace / "profile.md").write_text("# Fictional student\n", encoding="utf-8")
     (workspace / ".workspace.lock").touch()
-    for name in ("sessions", "plan-items", "summaries", "materials"):
+    for name in ("sessions", "plan-items", "summaries", "materials", "observations"):
         (workspace / name).mkdir()
 
     session_values = list(sessions)
@@ -116,6 +141,12 @@ def create_workspace(
         )
     for fact in plan_values:
         path = workspace / "plan-items" / f"{fact['record_id']}.json"
+        path.write_text(
+            json.dumps(fact, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    for fact in observations:
+        path = workspace / "observations" / f"{fact['record_id']}.json"
         path.write_text(
             json.dumps(fact, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",

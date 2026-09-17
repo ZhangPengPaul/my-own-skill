@@ -26,6 +26,7 @@ from validate_student_data import (  # noqa: E402
 )
 from tests.workspace_fixtures import (  # noqa: E402
     create_workspace,
+    interaction_observation,
     knowledge_observation,
     plan_fact,
     session_fact,
@@ -36,7 +37,13 @@ from tests.workspace_fixtures import (  # noqa: E402
 class ValidateStudentDataTest(unittest.TestCase):
     def run_validator(self, workspace):
         return subprocess.run(
-            [sys.executable, str(VALIDATOR_SCRIPT), str(workspace)],
+            [
+                sys.executable,
+                str(VALIDATOR_SCRIPT),
+                str(workspace),
+                "--student-id",
+                "student-a",
+            ],
             capture_output=True,
             text=True,
         )
@@ -61,6 +68,154 @@ class ValidateStudentDataTest(unittest.TestCase):
         self.assertEqual(expected, snapshot.state)
         self.assertEqual((), snapshot.sessions)
         self.assertEqual((), snapshot.plan_items)
+        self.assertEqual((), snapshot.observations)
+
+    def test_reads_validated_observations(self):
+        observation = interaction_observation()
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace, observations=[observation])
+            snapshot = validate_workspace(workspace)
+        self.assertEqual((observation,), snapshot.observations)
+
+    def test_snapshot_rejects_record_id_collisions_across_all_fact_types(self):
+        for types in (("sessions", "plan_items"), ("sessions", "observations"),
+                      ("plan_items", "observations")):
+            for consistent in (True, False):
+                with self.subTest(types=types, consistent=consistent), tempfile.TemporaryDirectory() as tmp:
+                    workspace = Path(tmp) / "student-a"
+                    # An empty state allows deliberately malformed cross-type input
+                    # without invoking reconcile_state in the fixture builder.
+                    state = state_from_facts()
+                    facts = {
+                        "sessions": [session_fact(record_id="shared-record")],
+                        "plan_items": [plan_fact(record_id="shared-record")],
+                        "observations": [interaction_observation(record_id="shared-record")],
+                    }
+                    if "observations" in types:
+                        state = state_from_facts(**{
+                            name: facts[name] for name in types if name != "observations"
+                        })
+                    create_workspace(workspace, state=state, **{name: facts[name] for name in types})
+                    with self.assertRaisesRegex(ValidationError, "duplicate record_id: shared-record"):
+                        validate_student_data.read_workspace_snapshot(
+                            workspace, require_consistent_state=consistent,
+                        )
+
+    def test_legacy_workspace_is_migrated_on_validation(self):
+        session = session_fact(observations=[knowledge_observation()])
+        plan = plan_fact()
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace, sessions=[session], plan_items=[plan])
+            (workspace / "observations").rmdir()
+            snapshot = validate_workspace(workspace)
+            self.assertTrue((workspace / "observations").is_dir())
+            self.assertEqual((session,), snapshot.sessions)
+            self.assertEqual((plan,), snapshot.plan_items)
+
+    def test_validation_keeps_using_held_workspace_when_alias_is_retargeted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            original = base / "student-a"
+            replacement = base / "student-b"
+            create_workspace(original)
+            create_workspace(replacement, observations=[interaction_observation()])
+            (original / "observations").rmdir()
+            alias = base / "student-alias"
+            try:
+                alias.symlink_to(original, target_is_directory=True)
+            except (NotImplementedError, OSError) as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+
+            real_open_workspace = validate_student_data.open_workspace_descriptor
+            open_count = 0
+
+            def open_then_retarget(path):
+                nonlocal open_count
+                root_fd = real_open_workspace(path)
+                open_count += 1
+                if open_count == 1:
+                    alias.unlink()
+                    alias.symlink_to(replacement, target_is_directory=True)
+                return root_fd
+
+            with mock.patch.object(
+                validate_student_data,
+                "open_workspace_descriptor",
+                side_effect=open_then_retarget,
+            ):
+                snapshot = validate_workspace(alias)
+
+            self.assertEqual(1, open_count)
+            self.assertEqual("student-a", snapshot.state["student_id"])
+            self.assertEqual((), snapshot.observations)
+            self.assertTrue((original / "observations").is_dir())
+
+    def test_legacy_migration_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace)
+            (workspace / "observations").rmdir()
+            validate_student_data.migrate_workspace(workspace)
+            validate_student_data.migrate_workspace(workspace)
+            self.assertTrue((workspace / "observations").is_dir())
+
+    def test_migration_rejects_observations_symlink_or_non_directory(self):
+        for replacement in ("symlink", "file"):
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "student-a"
+                create_workspace(workspace)
+                target = workspace / "observations"
+                target.rmdir()
+                if replacement == "symlink":
+                    outside = root / "outside"
+                    outside.mkdir()
+                    try:
+                        target.symlink_to(outside, target_is_directory=True)
+                    except (NotImplementedError, OSError) as error:
+                        self.skipTest(f"symlinks are unavailable: {error}")
+                else:
+                    target.write_text("not a directory", encoding="utf-8")
+                with self.assertRaisesRegex(ValidationError, "directory|invalid type|symlink"):
+                    validate_student_data.migrate_workspace(workspace)
+
+    def test_rejects_invalid_observation_filename(self):
+        observation = interaction_observation()
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace, observations=[observation])
+            (workspace / "observations" / "observation-001.json").rename(
+                workspace / "observations" / "alias.json"
+            )
+            with self.assertRaisesRegex(ValidationError, "filename|record_id"):
+                validate_workspace(workspace)
+
+    def test_rejects_symlinked_observation_fact(self):
+        observation = interaction_observation()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "student-a"
+            create_workspace(workspace)
+            outside = root / "outside.json"
+            outside.write_text(json.dumps(observation), encoding="utf-8")
+            link = workspace / "observations" / "observation-001.json"
+            try:
+                link.symlink_to(outside)
+            except (NotImplementedError, OSError) as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+            with self.assertRaisesRegex(ValidationError, "invalid type|symlink"):
+                validate_workspace(workspace)
+
+    def test_rejects_malformed_observation_fact(self):
+        observation = interaction_observation()
+        observation.pop("signal")
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            create_workspace(workspace, observations=[observation])
+            with self.assertRaisesRegex(ValidationError, "signal|required|observation"):
+                validate_workspace(workspace)
 
     def test_accepts_state_derived_from_active_facts(self):
         session = session_fact(observations=[knowledge_observation()])
@@ -274,6 +429,7 @@ class ValidateStudentDataTest(unittest.TestCase):
             ("plan-items", True),
             ("summaries", True),
             ("materials", True),
+            ("observations", True),
         ):
             with self.subTest(relative=relative), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)

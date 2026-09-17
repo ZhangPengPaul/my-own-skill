@@ -66,9 +66,9 @@ SUBJECT_RULES = {
 
 
 class ReferenceContractTest(unittest.TestCase):
-    def test_only_six_subject_references_exist(self):
+    def test_only_six_subject_references_and_observation_guide_exist(self):
         self.assertEqual(
-            set(MODULES),
+            set(MODULES) | {"observation-memory.md"},
             {path.name for path in REFERENCE_DIR.glob("*.md")},
         )
 

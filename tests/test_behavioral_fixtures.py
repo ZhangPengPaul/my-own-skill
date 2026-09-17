@@ -28,6 +28,8 @@ EXPECTED_IDS = {
     "multi-weakness-priority",
     "unreadable-input",
     "no-evidence-no-mastery",
+    "ordinary-question-first",
+    "repeated-observation-validation",
 }
 PHASE_ONE_SUBJECTS = ("语文", "数学", "英语", "政治", "历史", "地理")
 SUBJECT_LOOP_CASES = {
@@ -169,7 +171,7 @@ class BehavioralFixtureTest(unittest.TestCase):
     def test_case_catalog_has_strict_phase_one_schema(self):
         cases = json.loads((BEHAVIORAL / "cases.json").read_text(encoding="utf-8"))
         self.assertIs(type(cases), list)
-        self.assertEqual(12, len(cases))
+        self.assertEqual(14, len(cases))
 
         ids = set()
         for index, case in enumerate(cases):
@@ -210,6 +212,25 @@ class BehavioralFixtureTest(unittest.TestCase):
         for case_id in EXPECTED_IDS:
             with self.subTest(case_id=case_id):
                 self.assertEqual(1, summary.count(case_id))
+
+    def test_forward_summary_records_complete_current_run(self):
+        summary = FORWARD_SUMMARY.read_text(encoding="utf-8")
+        rows = {
+            parts[1].strip(): [part.strip() for part in parts[2:-1]]
+            for line in summary.splitlines()
+            if line.startswith("| ")
+            for parts in [line.split("|")]
+        }
+        for case_id in EXPECTED_IDS:
+            with self.subTest(case_id=case_id):
+                self.assertEqual(["是", "是", "PASS"], rows[case_id][:3])
+        self.assertEqual(14, sum(row[2] == "PASS" for row in rows.values() if len(row) > 2))
+        self.assertEqual(0, sum(row[2] == "NOT RUN" for row in rows.values() if len(row) > 2))
+        self.assertIn("当前目录共 14 个案例", summary)
+        self.assertIn("2026-09-17", summary)
+        self.assertIn("full-14-case-run-2", summary)
+        self.assertIn("14/14", summary)
+        self.assertIn("152/152", summary)
 
     def test_each_subject_has_complete_evidence_loop_case(self):
         cases = json.loads((BEHAVIORAL / "cases.json").read_text(encoding="utf-8"))
@@ -253,6 +274,17 @@ class BehavioralFixtureTest(unittest.TestCase):
             with self.subTest(outcome=outcome):
                 self.assertIn(outcome, direct["must"])
         self.assertIn("因为提供了解析而更新掌握状态", direct["must_not"])
+
+    def test_ordinary_question_case_is_answerable_without_exposing_observation(self):
+        cases = json.loads((BEHAVIORAL / "cases.json").read_text(encoding="utf-8"))
+        ordinary = next(
+            case for case in cases if case["id"] == "ordinary-question-first"
+        )
+        self.assertIn("(x-2)(x-3)=0", ordinary["prompt"])
+        self.assertIn("x=2 或 x=3", ordinary["prompt"])
+        self.assertIn("直接解释零乘积性质", ordinary["must"])
+        self.assertNotIn("可保留低强度结构化观察", ordinary["must"])
+        self.assertIn("向学生公开后台观察或记录动作", ordinary["must_not"])
 
 
 if __name__ == "__main__":

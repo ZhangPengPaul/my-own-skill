@@ -36,6 +36,314 @@ class InitStudentTest(unittest.TestCase):
             text=True,
         )
 
+    def run_cli(self, *arguments, environment=None, cwd=None):
+        env = os.environ.copy()
+        env.pop("SHANGHAI_HIGH_SCHOOL_STUDY_COACH_ROOT", None)
+        if environment:
+            env.update(environment)
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *map(str, arguments)],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=cwd,
+        )
+
+    def test_root_selection_prefers_flag_then_environment_then_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            explicit_root = base / "explicit"
+            environment_root = base / "environment"
+            home = base / "home"
+
+            explicit = self.run_cli(
+                "--root",
+                explicit_root,
+                "student-a",
+                environment={
+                    "SHANGHAI_HIGH_SCHOOL_STUDY_COACH_ROOT": str(environment_root),
+                    "HOME": str(home),
+                },
+            )
+            self.assertEqual(0, explicit.returncode, explicit.stderr)
+            self.assertEqual(
+                str((explicit_root / "student-a").resolve(),),
+                explicit.stdout.strip(),
+            )
+            self.assertFalse(environment_root.exists())
+
+            from_environment = self.run_cli(
+                "student-b",
+                environment={
+                    "SHANGHAI_HIGH_SCHOOL_STUDY_COACH_ROOT": str(environment_root),
+                    "HOME": str(home),
+                },
+            )
+            self.assertEqual(0, from_environment.returncode, from_environment.stderr)
+            self.assertEqual(
+                str((environment_root / "student-b").resolve(),),
+                from_environment.stdout.strip(),
+            )
+
+            default = self.run_cli("student-c", environment={"HOME": str(home)})
+            default_root = (
+                home
+                / ".local/share/shanghai-high-school-study-coach/student-workspaces"
+            )
+            self.assertEqual(0, default.returncode, default.stderr)
+            self.assertEqual(
+                str((default_root / "student-c").resolve(),),
+                default.stdout.strip(),
+            )
+            self.assertEqual(0o700, stat.S_IMODE(default_root.stat().st_mode))
+
+    def test_rejects_empty_or_relative_environment_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            for configured_root in ("", "relative-workspaces"):
+                with self.subTest(configured_root=configured_root):
+                    result = self.run_cli(
+                        "student-a",
+                        environment={
+                            "HOME": str(home),
+                            "SHANGHAI_HIGH_SCHOOL_STUDY_COACH_ROOT": configured_root,
+                        },
+                    )
+                    self.assertEqual(1, result.returncode)
+                    self.assertIn("ERROR:", result.stderr)
+
+    def test_explicit_relative_root_remains_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            relative_root = Path("relative-root")
+            result = self.run_cli(
+                "--root", relative_root, "student-a", cwd=tmp
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(
+                str((Path(tmp) / relative_root / "student-a").resolve()),
+                result.stdout.strip(),
+            )
+
+    def test_ensure_returns_existing_valid_workspace_without_changing_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(0, self.run_init(root, "student-a").returncode)
+            workspace = root / "student-a"
+            state = workspace / "state.json"
+            before_content = state.read_bytes()
+            before_stat = state.stat()
+
+            result = self.run_cli("--root", root, "--ensure", "student-a")
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(str(workspace.resolve()), result.stdout.strip())
+            self.assertEqual(before_content, state.read_bytes())
+            self.assertEqual(before_stat.st_mtime_ns, state.stat().st_mtime_ns)
+
+    def test_ensure_status_reports_created_then_existing_as_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            created = self.run_cli(
+                "--root", root, "--ensure", "--report-status", "student-a"
+            )
+            self.assertEqual(0, created.returncode, created.stderr)
+            self.assertEqual(
+                {
+                    "status": "created",
+                    "workspace": str((root / "student-a").resolve()),
+                },
+                json.loads(created.stdout),
+            )
+
+            existing = self.run_cli(
+                "--root", root, "--ensure", "--report-status", "student-a"
+            )
+            self.assertEqual(0, existing.returncode, existing.stderr)
+            self.assertEqual(
+                {
+                    "status": "existing",
+                    "workspace": str((root / "student-a").resolve()),
+                },
+                json.loads(existing.stdout),
+            )
+
+    def test_ensure_status_reports_legacy_observation_migration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(0, self.run_init(root, "student-a").returncode)
+            workspace = root / "student-a"
+            (workspace / "observations").rmdir()
+
+            result = self.run_cli(
+                "--root", root, "--ensure", "--report-status", "student-a"
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual(
+                {
+                    "status": "migrated",
+                    "workspace": str(workspace.resolve()),
+                },
+                json.loads(result.stdout),
+            )
+            self.assertTrue((workspace / "observations").is_dir())
+
+    def test_report_status_requires_ensure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_cli(
+                "--root", Path(tmp), "--report-status", "student-a"
+            )
+
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("--report-status requires --ensure", result.stderr)
+
+    def test_ensure_existing_workspace_does_not_require_templates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(0, self.run_init(root, "student-a").returncode)
+            missing_templates = root / "missing-templates"
+
+            with mock.patch.object(init_student, "TEMPLATE", missing_templates):
+                destination = init_student.ensure_workspace(root, "student-a")
+
+            self.assertEqual((root / "student-a").resolve(), destination)
+
+    def test_ensure_rejects_existing_workspace_with_wrong_state_student_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(0, self.run_init(root, "student-b").returncode)
+            wrong_workspace = root / "student-b"
+            workspace = root / "student-a"
+            wrong_workspace.rename(workspace)
+            before_state = (workspace / "state.json").read_bytes()
+
+            result = self.run_cli("--root", root, "--ensure", "student-a")
+
+            self.assertEqual(1, result.returncode)
+            self.assertIn("student_id", result.stderr)
+            self.assertEqual(before_state, (workspace / "state.json").read_bytes())
+
+    def test_ensure_rejects_symbolic_link_at_student_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "root"
+            outside = base / "outside"
+            self.assertEqual(0, self.run_init(outside, "student-a").returncode)
+            root.mkdir()
+            try:
+                (root / "student-a").symlink_to(
+                    outside / "student-a", target_is_directory=True
+                )
+            except (NotImplementedError, OSError) as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+
+            result = self.run_cli("--root", root, "--ensure", "student-a")
+
+            self.assertEqual(1, result.returncode)
+            self.assertIn("symbolic link", result.stderr)
+
+    def test_ensure_is_concurrent_and_create_only_raises_typed_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            commands = [
+                [sys.executable, str(SCRIPT), "--root", str(root), "--ensure", "student-a"]
+                for _ in range(2)
+            ]
+            processes = [
+                subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                for command in commands
+            ]
+            results = [process.communicate() for process in processes]
+            self.assertEqual([0, 0], [process.returncode for process in processes], results)
+            self.assertTrue((root / "student-a").is_dir())
+            with self.assertRaises(init_student.WorkspaceExistsError):
+                init_student.initialize(root, "student-a")
+
+    def test_ensure_uses_the_original_root_when_alias_is_retargeted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            real_root = base / "real-root"
+            attacker_root = base / "attacker-root"
+            self.assertEqual(0, self.run_init(real_root, "student-a").returncode)
+            self.assertEqual(0, self.run_init(attacker_root, "student-a").returncode)
+            alias = base / "root-alias"
+            try:
+                alias.symlink_to(real_root, target_is_directory=True)
+            except (NotImplementedError, OSError) as error:
+                self.skipTest(f"symlinks are unavailable: {error}")
+
+            original = init_student._raise_if_destination_exists
+            calls = 0
+
+            def retarget_alias_after_conflict(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    if calls == 1:
+                        alias.unlink()
+                        alias.symlink_to(attacker_root, target_is_directory=True)
+
+            with mock.patch.object(
+                init_student,
+                "_raise_if_destination_exists",
+                side_effect=retarget_alias_after_conflict,
+            ):
+                destination = init_student.ensure_workspace(alias, "student-a")
+
+            self.assertEqual((real_root / "student-a").resolve(), destination)
+
+    def test_ensure_reports_when_conflicting_workspace_disappears(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "student-a"
+            self.assertEqual(0, self.run_init(root, "student-a").returncode)
+
+            def remove_and_report_conflict(*args, **kwargs):
+                shutil.rmtree(workspace)
+                raise init_student.WorkspaceExistsError("workspace already exists")
+
+            with mock.patch.object(
+                init_student,
+                "_initialize_with_root_fd",
+                side_effect=remove_and_report_conflict,
+            ), self.assertRaisesRegex(init_student.ValidationError, "disappeared"):
+                init_student.ensure_workspace(root, "student-a")
+
+    def test_ensure_does_not_migrate_legacy_workspace_with_wrong_student_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(0, self.run_init(root, "student-b").returncode)
+            workspace = root / "student-b"
+            (workspace / "observations").rmdir()
+            workspace.rename(root / "student-a")
+            workspace = root / "student-a"
+            before_state = (workspace / "state.json").read_bytes()
+
+            with self.assertRaisesRegex(init_student.ValidationError, "student_id"):
+                init_student.ensure_workspace(root, "student-a")
+
+            self.assertFalse((workspace / "observations").exists())
+            self.assertEqual(before_state, (workspace / "state.json").read_bytes())
+
+    def test_ensure_does_not_migrate_damaged_legacy_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(0, self.run_init(root, "student-a").returncode)
+            workspace = root / "student-a"
+            (workspace / "observations").rmdir()
+            state = workspace / "state.json"
+            state.write_text("not JSON", encoding="utf-8")
+            before_state = state.read_bytes()
+
+            with self.assertRaisesRegex(init_student.ValidationError, "JSON"):
+                init_student.ensure_workspace(root, "student-a")
+
+            self.assertFalse((workspace / "observations").exists())
+            self.assertEqual(before_state, state.read_bytes())
+
     def assert_template_error(self, mutate_template):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -270,6 +578,22 @@ class InitStudentTest(unittest.TestCase):
             result = self.run_init(root, "student-a")
             self.assertNotEqual(0, result.returncode)
             self.assertEqual("preserve", marker.read_text(encoding="utf-8"))
+
+    def test_creates_observations_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = self.run_init(Path(tmp), "student-a")
+            self.assertEqual(0, destination.returncode)
+            self.assertTrue((Path(tmp) / "student-a" / "observations").is_dir())
+
+    def test_migrates_old_workspace_by_creating_observations_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "student-a"
+            self.run_init(Path(tmp), "student-a")
+            (workspace / "observations").rmdir()
+            from validate_student_data import migrate_workspace
+
+            migrate_workspace(workspace)
+            self.assertTrue((workspace / "observations").is_dir())
 
     def test_invalid_id_leaves_no_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
